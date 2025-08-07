@@ -1,0 +1,31 @@
+apiVersion: conversion.example.com/v1
+kind: Example
+metadata:
+  name: argocd-managed-v1
+  namespace: default
+  labels:
+    managed-by: argocd
+spec:
+  field1: "argocd-managed-v1-resource"
+---
+apiVersion: conversion.example.com/v2
+kind: Example
+metadata:
+  name: argocd-managed-v2
+  namespace: default
+  labels:
+    managed-by: argocd
+spec:
+  field1: "argocd-managed-v2-resource"
+  field2: "managed-by-argocd"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webhook-test-config
+  namespace: default
+  labels:
+    managed-by: argocd
+data:
+  message: "This ConfigMap is managed by Argo CD alongside CRD resources"
+  test-scenario: "conversion-webhook-failure"
