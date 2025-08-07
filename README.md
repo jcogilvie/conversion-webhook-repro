@@ -6,6 +6,7 @@ This reproduction case demonstrates the failure scenario where a CRD conversion 
 
 - `kind` (Kubernetes in Docker) installed
 - `kubectl` installed
+- `helm` installed
 - Docker running
 
 ## Quick Start
@@ -107,7 +108,56 @@ kubectl get examples test-example-v1 -o jsonpath='{.apiVersion}' && echo
 kubectl get examples test-example-v2 -o jsonpath='{.apiVersion}' && echo
 ```
 
-### Step 8: Simulate Webhook Service Failure
+### Step 8: Install Argo CD to Observe the Failure
+
+Now let's install Argo CD to demonstrate how this webhook failure affects real applications:
+
+```bash
+# Add the Argo CD Helm repository
+helm repo add argo https://argoproj.github.io/argo-helm
+helm repo update
+
+# Create a namespace for Argo CD
+kubectl create namespace argocd
+
+# Install Argo CD via Helm
+helm install argocd argo/argo-cd \
+  --namespace argocd \
+  --set server.service.type=ClusterIP \
+  --set configs.params."server.insecure"=true
+
+# Wait for Argo CD to be ready
+kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-server -n argocd --timeout=300s
+```
+
+### Step 9: Access Argo CD Dashboard
+
+```bash
+# Get the initial admin password
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d && echo
+
+# Port forward to access the Argo CD dashboard
+kubectl port-forward svc/argocd-server -n argocd 8080:443 &
+
+# Note: The dashboard will be available at http://localhost:8080
+# Username: admin
+# Password: (output from the command above)
+```
+
+Keep this port-forward running in the background. You can now access the Argo CD dashboard at http://localhost:8080
+
+### Step 10: Create Argo CD Applications
+
+Create Argo CD applications that will be affected by the webhook failure:
+
+```bash
+# Apply the Argo CD applications
+kubectl apply -f manifests/argocd-applications.yaml
+```
+
+Wait for the applications to appear in the Argo CD dashboard, then proceed to the next step.
+
+### Step 11: Simulate Webhook Service Failure
 
 The most effective way to reproduce the webhook failure is to delete the service:
 
@@ -119,7 +169,45 @@ kubectl delete service conversion-webhook-service -n webhook-system
 kubectl get svc -n webhook-system
 ```
 
-### Step 9: Reproduce the Failure
+### Step 12: Force Argo CD Cache Refresh
+
+After breaking the webhook service, we need to evict Argo CD's cache to see the full impact:
+
+```bash
+# Restart Argo CD components to force cache refresh
+kubectl rollout restart deployment/argocd-server -n argocd
+kubectl rollout restart deployment/argocd-repo-server -n argocd
+
+# Wait for restarts to complete
+kubectl rollout status deployment/argocd-server -n argocd
+kubectl rollout status deployment/argocd-repo-server -n argocd
+```
+
+Now you can observe how Argo CD reacts to the webhook failure:
+
+**In the Argo CD Dashboard (http://localhost:8080):**
+1. Navigate to the Applications view
+2. Look for sync errors or health issues with applications
+3. Check the application details for webhook-related errors
+
+**Via CLI:**
+```bash
+# Check Argo CD application status
+kubectl get applications -n argocd
+
+# Get detailed status of our test application
+kubectl describe application example-crd-app -n argocd
+
+# Check Argo CD server logs for webhook errors
+kubectl logs -l app.kubernetes.io/name=argocd-server -n argocd --tail=50
+
+# Check repo server logs for webhook errors
+kubectl logs -l app.kubernetes.io/name=argocd-repo-server -n argocd --tail=50
+```
+
+You should see Argo CD struggling with resource discovery or synchronization due to the webhook failures.
+
+### Step 13: Reproduce the Direct Failures
 
 Now trigger operations that invoke the conversion webhook. These will fail with the service deleted:
 
@@ -151,6 +239,16 @@ This should produce an error like:
 Error from server: conversion webhook for conversion.example.com/v2, Kind=Example failed: Post "https://conversion-webhook-service.webhook-system.svc:443/convert?timeout=30s": service "conversion-webhook-service" not found
 ```
 
+#### Observe Argo CD Impact
+After triggering these failures and restarting Argo CD components, check Argo CD again:
+```bash
+# Force Argo CD to refresh and see the impact
+kubectl patch application example-crd-app -n argocd --type='merge' -p='{"operation":{"initiatedBy":{"username":"admin"},"sync":{"revision":"HEAD"}}}'
+
+# Check for errors in Argo CD logs related to resource discovery
+kubectl logs -l app.kubernetes.io/name=argocd-application-controller -n argocd --tail=20 | grep -i "conversion\|webhook\|error"
+```
+
 ### Expected Error Output
 
 You should see errors similar to:
@@ -173,10 +271,11 @@ from server for: "manifests/test-resources.yaml": conversion webhook for convers
 - Operations involving v1 resources fail because v2 is the storage version, requiring conversion
 - The error specifically mentions the missing service, demonstrating the exact failure mode
 - This reproduces the same type of failure that affects Argo CD when conversion webhook services are unavailable
+- **Argo CD Impact**: Resource discovery, synchronization, and health checks all fail when conversion webhooks are unavailable
 
-### Step 10: Restore Service (Optional)
+### Step 14: Restore Service and Observe Recovery
 
-To restore functionality:
+To restore functionality and see Argo CD recover:
 
 ```bash
 # Recreate the webhook service
@@ -188,14 +287,38 @@ kubectl wait --for=condition=ready pod -l app=conversion-webhook -n webhook-syst
 # Verify operations work again
 kubectl get examples.v1.conversion.example.com
 kubectl get examples
+
+# Restart Argo CD components again to clear error states
+kubectl rollout restart deployment/argocd-server -n argocd
+kubectl rollout restart deployment/argocd-repo-server -n argocd
+
+# Wait for restarts to complete
+kubectl rollout status deployment/argocd-server -n argocd
+kubectl rollout status deployment/argocd-repo-server -n argocd
+
+# Trigger Argo CD to resync and observe recovery
+kubectl patch application example-crd-app -n argocd --type='merge' -p='{"operation":{"initiatedBy":{"username":"admin"},"sync":{"revision":"HEAD"}}}'
+
+# Check Argo CD application status recovery
+kubectl get applications -n argocd
 ```
 
-### Step 11: Cleanup
+You should see Argo CD applications return to healthy status once the webhook service is restored and caches are cleared.
+
+### Step 15: Cleanup
 
 ```bash
-# Delete test resources
+# Stop the port-forward (if running in background, find the PID and kill it)
+pkill -f "kubectl port-forward.*argocd-server" || echo "Port-forward already stopped"
+
+# Delete test resources and applications
 kubectl delete examples --all
+kubectl delete applications --all -n argocd
 kubectl delete -f manifests/
+
+# Uninstall Argo CD
+helm uninstall argocd -n argocd
+kubectl delete namespace argocd
 kubectl delete namespace webhook-system
 
 # Delete the kind cluster
@@ -211,6 +334,12 @@ rm -rf /tmp/webhook-certs
 2. **Resource Operations Blocked**: All operations involving the CRD (create, read, update, delete) are blocked
 3. **Kubernetes API Dependency**: The Kubernetes API server cannot process requests for the CRD without a working conversion webhook
 4. **Service Discovery**: The error shows that Kubernetes tries to reach the webhook service but cannot establish a connection
+5. **Argo CD Integration**: Demonstrates how these webhook failures directly impact Argo CD's ability to:
+    - Discover and manage custom resources
+    - Perform application synchronization
+    - Maintain resource health monitoring
+    - Execute automated sync policies
+6. **Cache Management**: Shows the importance of restarting Argo CD components to properly observe webhook failures and recoveries
 
 This reproduction case demonstrates the exact scenario described in the Argo CD issue where CRD operations fail when conversion webhook services are unavailable.
 
@@ -229,7 +358,10 @@ webhook-conversion/
 ├── manifests/
 │   ├── crd-with-webhook.yaml
 │   ├── webhook-deployment.yaml
-│   └── test-resources.yaml
+│   ├── test-resources.yaml
+│   └── argocd-applications.yaml
+├── argocd-managed/
+│   └── resources.yaml
 ├── go.mod
 ├── go.sum
 ├── Dockerfile
