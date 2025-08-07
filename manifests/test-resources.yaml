@@ -1,0 +1,16 @@
+apiVersion: conversion.example.com/v1
+kind: Example
+metadata:
+  name: test-example-v1
+  namespace: default
+spec:
+  field1: "test-value-v1"
+---
+apiVersion: conversion.example.com/v2
+kind: Example
+metadata:
+  name: test-example-v2
+  namespace: default
+spec:
+  field1: "test-value-v2"
+  field2: "additional-field"
