@@ -17,7 +17,7 @@ This project includes all necessary files to reproduce the webhook failure scena
 
 ```bash
 # Create a new kind cluster
-kind create cluster --name webhook-test
+kind create cluster --name webhook-test --image kindest/node:v1.32.5@sha256:e3b2327e3a5ab8c76f5ece68936e4cafaa82edf58486b769727ab0b3b97a5b0d
 
 # Verify cluster is running
 kubectl cluster-info --context kind-webhook-test
@@ -124,7 +124,8 @@ kubectl create namespace argocd
 helm install argocd argo/argo-cd \
   --namespace argocd \
   --set server.service.type=ClusterIP \
-  --set configs.params."server.insecure"=true
+  --set configs.params."server.insecure"=true \
+  --version 7.6.10
 
 # Wait for Argo CD to be ready
 kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-server -n argocd --timeout=300s
@@ -175,12 +176,16 @@ After breaking the webhook service, we need to evict Argo CD's cache to see the 
 
 ```bash
 # Restart Argo CD components to force cache refresh
-kubectl rollout restart deployment/argocd-server -n argocd
-kubectl rollout restart deployment/argocd-repo-server -n argocd
+kubectl rollout restart deployment/argocd-server deployment/argocd-repo-server statefulset/argocd-application-controller -n argocd
 
 # Wait for restarts to complete
 kubectl rollout status deployment/argocd-server -n argocd
 kubectl rollout status deployment/argocd-repo-server -n argocd
+```
+
+Reconnect to port forwarding:
+```bash
+kubectl port-forward svc/argocd-server -n argocd 8080:443 &
 ```
 
 Now you can observe how Argo CD reacts to the webhook failure:
