@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: conversion-webhook
+  namespace: webhook-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: conversion-webhook
+  template:
+    metadata:
+      labels:
+        app: conversion-webhook
+    spec:
+      containers:
+        - name: webhook
+          image: webhook-conversion:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8443
+          env:
+            - name: TLS_CERT_FILE
+              value: /etc/certs/tls.crt
+            - name: TLS_PRIVATE_KEY_FILE
+              value: /etc/certs/tls.key
+          volumeMounts:
+            - name: certs
+              mountPath: /etc/certs
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: certs
+          secret:
+            secretName: webhook-certs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: conversion-webhook-service
+  namespace: webhook-system
+spec:
+  selector:
+    app: conversion-webhook
+  ports:
+    - port: 443
+      targetPort: 8443
+      protocol: TCP

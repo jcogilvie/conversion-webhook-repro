@@ -41,3 +41,26 @@ spec:
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: webhook-service-app
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: 'https://github.com/jcogilvie/conversion-webhook-repro.git'
+    path: webhook-service-managed
+    targetRevision: HEAD
+  destination:
+    server: TARGET_SERVER_PLACEHOLDER
+    namespace: webhook-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

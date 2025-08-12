@@ -106,7 +106,8 @@ kubectl create namespace argocd
 helm install argocd argo/argo-cd \
   --namespace argocd \
   --set server.service.type=ClusterIP \
-  --set configs.params."server.insecure"=true
+  --set configs.params."server.insecure"=true \
+  --version 7.6.10
 
 kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-server -n argocd --timeout=300s
 
