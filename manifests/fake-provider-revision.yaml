@@ -1,0 +1,19 @@
+apiVersion: pkg.crossplane.io/v1
+kind: ProviderRevision
+metadata:
+  name: example-provider-revision-12345
+  namespace: webhook-system
+spec:
+  package: example.com/example-provider:v1.0.0
+  revision: 1
+  desiredState: Active
+status:
+  conditions:
+    - type: Healthy
+      status: "True"
+      reason: HealthyPackageRevision
+    - type: Installed
+      status: "True"
+      reason: PackageInstalled
+  controllerRef:
+    name: example-provider-revision-12345
