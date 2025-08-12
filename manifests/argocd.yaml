@@ -1,0 +1,54 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argocd
+  namespace: argocd
+  # Add finalizer to prevent accidental deletion
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  
+  source:
+    # Official Argo CD Helm chart repository
+    repoURL: https://argoproj.github.io/argo-helm
+    chart: argo-cd
+    targetRevision: 5.51.6  # Use a specific version or "HEAD" for latest
+    helm:
+      # Since you installed with no additional values, we'll use minimal config
+      # You can add your custom values here if needed
+      values: |
+        # Minimal configuration - adjust based on your actual setup
+        global:
+          # Uncomment if you have specific domain requirements
+          # domain: argocd.example.com
+        
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+
+  syncPolicy:
+    # Enable auto-sync for continuous deployment
+    automated:
+      prune: true
+      selfHeal: true
+    
+    # Sync options for proper management
+    syncOptions:
+      - CreateNamespace=false  # Namespace should already exist
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+      # Uncomment if you need to skip CRD validation
+      # - SkipDryRunOnMissingResource=true
+    
+    # Retry policy for failed syncs
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  # Health and sync status
+  revisionHistoryLimit: 3
+
