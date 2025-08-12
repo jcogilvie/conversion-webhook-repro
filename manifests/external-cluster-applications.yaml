@@ -1,0 +1,43 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: external-cluster-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 'https://github.com/jcogilvie/conversion-webhook-repro.git'
+    path: argocd-managed
+    targetRevision: HEAD
+  destination:
+    server: TARGET_SERVER_PLACEHOLDER
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: webhook-test-external
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: 'https://github.com/argoproj/argocd-example-apps.git'
+    path: guestbook
+    targetRevision: HEAD
+  destination:
+    server: TARGET_SERVER_PLACEHOLDER
+    namespace: guestbook-external
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
