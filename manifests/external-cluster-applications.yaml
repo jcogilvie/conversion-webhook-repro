@@ -59,8 +59,6 @@ spec:
     server: TARGET_SERVER_PLACEHOLDER
     namespace: webhook-system
   syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
+    # this one specifically is manual so we don't autoresolve the errors we intend to create
     syncOptions:
       - CreateNamespace=true
