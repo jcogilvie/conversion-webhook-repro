@@ -4,140 +4,177 @@ set -e
 # Change to project root directory (one level up from scripts)
 cd "$(dirname "$0")/.."
 
-echo "💥 Breaking Conversion Webhook to Simulate Failure"
-echo "=================================================="
+echo "🔥 Simulating CRD Evolution with Broken Conversion Webhook"
+echo "=========================================================="
 
-# Get target server URL using Docker network IP (same logic as setup.sh)
-echo "🔍 Getting target cluster connection details..."
-TARGET_SERVER_RAW=$(kubectl config view --context=kind-target-cluster -o jsonpath='{.clusters[?(@.name=="kind-target-cluster")].cluster.server}')
-echo "🔍 Raw target server URL: $TARGET_SERVER_RAW"
+echo "📋 Current scenario:"
+echo "• CRD has v1 (storage) and v2 (served) without conversion webhook"
+echo "• Resources exist in both API versions"
+echo "• Argo CD is managing applications successfully"
+echo ""
+echo "🎯 Simulation: Adding conversion webhook pointing to non-existent service"
+echo "This mimics real-world scenarios where:"
+echo "• CRDs evolve to add conversion webhooks"
+echo "• Webhook services become unavailable after CRD update"
+echo "• Existing resources become inaccessible due to conversion failures"
 
-# Extract port from the localhost URL
-TARGET_PORT=$(echo $TARGET_SERVER_RAW | sed 's/.*://')
-echo "🔍 Target cluster port: $TARGET_PORT"
-
-# Get the Docker container IP for the target cluster
-TARGET_CONTAINER_IP=$(docker inspect target-cluster-control-plane --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
-echo "🔍 Target cluster Docker IP: $TARGET_CONTAINER_IP"
-
-# Construct the target server URL using Docker network IP
-TARGET_SERVER="https://${TARGET_CONTAINER_IP}:6443"
-echo "🔍 Target server URL for Argo CD: $TARGET_SERVER"
-
+echo ""
 echo "🎯 Switching to target cluster..."
 kubectl config use-context kind-target-cluster
 
-echo "🗑️  Simulating Crossplane provider upgrade scenario..."
-echo "     (This mimics what happened in the real incident)"
+echo "📋 Step 1: Verify current state - resources accessible in both API versions"
+echo "(Before removing webhook service and applying broken CRD)"
+echo "V1 resources:"
+kubectl get examples.v1.conversion.example.com || echo "⚠️ V1 API already broken - continuing with break process"
+echo ""
+echo "V2 resources:"
+kubectl get examples.v2.conversion.example.com || echo "⚠️ V2 API already broken - continuing with break process"
+echo ""
 
-# Delete the ProviderRevision that owns the CRD (simulating provider upgrade/rename)
-echo "📦 Deleting ProviderRevision (simulating provider removal/rename)..."
-kubectl delete providerrevision example-provider-revision-12345 -n webhook-system || echo "ProviderRevision already deleted"
-
-echo "🔍 Checking CRD owner references (should now be orphaned)..."
-kubectl get crd examples.conversion.example.com -o yaml | grep -A 10 ownerReferences || echo "No owner references found"
-
-echo "🚫 Choose additional failure method:"
-echo "  1) Delete webhook service (complete unavailability)"
-echo "  2) Break service selector (no endpoints available)"
-echo "  3) Only orphan ProviderRevision (keep webhook working)"
-read -p "Enter choice (1, 2, or 3): " choice
-
-case $choice in
-    1)
-        echo "🗑️  Deleting webhook service..."
-        kubectl delete service conversion-webhook-service -n webhook-system
-        kubectl get svc -n webhook-system
-        FAILURE_TYPE="service-deleted"
-        ;;
-    2)
-        echo "🔧 Breaking service selector..."
-        kubectl patch service conversion-webhook-service -n webhook-system --type='merge' -p='{"spec":{"selector":{"app":"non-existent-app"}}}'
-        kubectl get svc -n webhook-system
-        kubectl get endpoints conversion-webhook-service -n webhook-system
-        FAILURE_TYPE="no-endpoints"
-        ;;
-    3)
-        echo "📦 Only orphaning ProviderRevision (webhook still works)..."
-        FAILURE_TYPE="orphaned-only"
-        ;;
-    *)
-        echo "❌ Invalid choice. Using option 2 (break selector)..."
-        kubectl patch service conversion-webhook-service -n webhook-system --type='merge' -p='{"spec":{"selector":{"app":"non-existent-app"}}}'
-        kubectl get svc -n webhook-system
-        kubectl get endpoints conversion-webhook-service -n webhook-system
-        FAILURE_TYPE="no-endpoints"
-        ;;
-esac
-
-# Save failure type for fix script
-echo $FAILURE_TYPE > /tmp/webhook-failure-type
-
-echo "🔄 Switching to Argo CD cluster..."
+echo "🔄 Switching back to Argo CD cluster..."
 kubectl config use-context kind-argocd-cluster
 
-echo "🎯 Creating cluster discovery trigger application..."
-sed "s|TARGET_SERVER_PLACEHOLDER|$TARGET_SERVER|g" manifests/cluster-discovery-trigger.yaml | kubectl apply -f -
+echo "🗑️  Step 2: Remove webhook service application if it exists"
+echo "This simulates the webhook service being unavailable/deleted"
+kubectl delete application webhook-service-app -n argocd || echo "✅ Webhook service app doesn't exist (expected for first run)"
 
-echo "💥 Forcing cluster re-discovery by removing and re-adding cluster registration..."
-echo "    (This simulates the scenario where Argo CD tries to connect to a broken cluster)"
-
-# Delete the cluster registration
-echo "🗑️  Removing cluster registration from Argo CD..."
-kubectl delete secret target-cluster-secret -n argocd || echo "Cluster secret already deleted"
-
-# Wait a moment for Argo CD to notice the cluster is gone
-echo "⏳ Waiting for Argo CD to notice cluster removal..."
+echo ""
+echo "⏳ Waiting for Argo CD to clean up webhook service resources..."
 sleep 10
 
-# Re-add the cluster registration with the same broken state
-echo "🔄 Re-registering cluster (with broken CRDs and orphaned ownership)..."
+# Verify the webhook service is gone from target cluster
 kubectl config use-context kind-target-cluster
-TOKEN=$(kubectl get secret argocd-manager-token -n kube-system -o jsonpath='{.data.token}' | base64 -d)
-CA_CERT=$(kubectl get secret argocd-manager-token -n kube-system -o jsonpath='{.data.ca\.crt}')
+echo "🔍 Verifying webhook service removal..."
+kubectl get svc conversion-webhook-service -n webhook-system && echo "⚠️ Service still exists" || echo "✅ Webhook service removed"
+kubectl get pods -l app=conversion-webhook -n webhook-system && echo "⚠️ Pods still exist" || echo "✅ Webhook pods removed"
 
+echo "📋 Step 3: Apply CRD evolution - adding broken conversion webhook"
+echo "This simulates a CRD update that adds conversion webhook but the service is unavailable"
+kubectl apply -f manifests/crd-with-broken-webhook.yaml || echo "⚠️ CRD may already be in broken state"
+
+echo "✅ CRD updated with conversion webhook pointing to non-existent service"
+
+echo ""
+echo "📋 Step 4: Test direct impact on target cluster"
+echo "Attempting to access resources should now fail due to broken conversion webhook..."
+
+echo ""
+echo "🔍 Testing v1 API access (should fail):"
+kubectl get examples.v1.conversion.example.com || echo "❌ V1 API access failed as expected"
+
+echo ""
+echo "🔍 Testing v2 API access (should fail):"
+kubectl get examples.v2.conversion.example.com || echo "❌ V2 API access failed as expected"
+
+echo ""
+echo "🔍 Testing generic API access (should fail):"
+kubectl get examples || echo "❌ Generic API access failed as expected"
+
+echo ""
+echo "🔄 Step 5: Switch to Argo CD cluster and trigger cache invalidation"
 kubectl config use-context kind-argocd-cluster
-sed "s|TARGET_SERVER_PLACEHOLDER|$TARGET_SERVER|g; s|TOKEN_PLACEHOLDER|$TOKEN|g; s|CA_CERT_PLACEHOLDER|$CA_CERT|g" manifests/target-cluster-secret.yaml | kubectl apply -f -
 
-echo "🔍 Cluster registration re-added. Argo CD will now try to discover APIs in broken cluster..."
+echo "📱 Step 6: Force Argo CD to refresh target cluster cache"
+echo "This simulates Argo CD discovering the broken CRD state..."
 
-echo "♻️  Restarting Argo CD components to force fresh cluster discovery..."
-kubectl rollout restart deployment/argocd-server -n argocd
-kubectl rollout restart deployment/argocd-repo-server -n argocd
-kubectl rollout restart statefulset/argocd-application-controller -n argocd
+# Get the target server URL and encode it for the API call
+TARGET_SERVER_RAW=$(kubectl config view --context=kind-target-cluster -o jsonpath='{.clusters[?(@.name=="kind-target-cluster")].cluster.server}')
+TARGET_CONTAINER_IP=$(docker inspect target-cluster-control-plane --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+TARGET_SERVER="https://${TARGET_CONTAINER_IP}:6443"
 
-echo "⏳ Waiting for restarts to complete..."
-kubectl rollout status deployment/argocd-server -n argocd
-kubectl rollout status deployment/argocd-repo-server -n argocd
-kubectl rollout status statefulset/argocd-application-controller -n argocd
+# Double URL encode the target server for the API call
+DOUBLE_ENCODED_SERVER=$(echo "$TARGET_SERVER" | sed 's/:/%253A/g' | sed 's/\//%252F/g')
 
-echo ""
-echo "🔥 Webhook failure simulation complete!"
-echo "======================================"
-echo ""
-echo "🔍 Check for failures:"
-echo "1. Argo CD Dashboard: http://localhost:8080 (if port-forward is running)"
-echo "2. Application status: kubectl get applications -n argocd"
-echo "3. Application details: kubectl describe application cluster-discovery-trigger -n argocd"
-echo ""
-echo "📋 Test direct failures in target cluster:"
-echo "   kubectl config use-context kind-target-cluster"
-echo "   kubectl apply -f manifests/test-resources.yaml"
-echo "   kubectl get examples.v1.conversion.example.com"
-echo ""
-echo "🛠️  Run './fix.sh' to restore functionality"
-echo ""
-echo "🔥 Expected errors:"
-if [ "$FAILURE_TYPE" = "service-deleted" ]; then
-    echo "   - 'service \"conversion-webhook-service\" not found'"
-elif [ "$FAILURE_TYPE" = "orphaned-only" ]; then
-    echo "   - Potential cluster cache sync failures due to orphaned CRD ownership"
-    echo "   - 'failed to sync cluster cache' (global cluster discovery failure)"
+echo "🔄 Method 1: Invalidate cluster cache via Argo CD API (with authentication)"
+echo "Using cluster: $TARGET_SERVER"
+
+# Get the admin password from the Kubernetes secret
+ADMIN_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+
+# First, login to get a session token
+echo "🔐 Authenticating with Argo CD..."
+LOGIN_RESPONSE=$(curl -k -X POST \
+  "http://localhost:8080/api/v1/session" \
+  -H "Content-Type: application/json" \
+  -d "{\"username\":\"admin\",\"password\":\"$ADMIN_PASSWORD\"}" \
+  --fail-with-body 2>/dev/null || echo "LOGIN_FAILED")
+
+if [[ "$LOGIN_RESPONSE" == *"LOGIN_FAILED"* ]]; then
+  echo "⚠️ Login failed - falling back to manual UI method"
+  ENCODED_TARGET_SERVER=$(echo "$TARGET_SERVER" | sed 's/:/%3A/g' | sed 's/\//%2F/g')
+  echo "   Argo CD Cluster Page: http://localhost:8080/settings/clusters/$ENCODED_TARGET_SERVER"
+  echo "   Click 'Invalidate Cache' button on the cluster page"
 else
-    echo "   - 'no endpoints available for service' or 'connect: connection refused'"
+  # Extract the token from the login response
+  TOKEN=$(echo "$LOGIN_RESPONSE" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+
+  if [[ -n "$TOKEN" ]]; then
+    echo "✅ Authentication successful"
+
+    # Now call the cache invalidation API with the token
+    echo "🔄 Calling cache invalidation API..."
+    RESPONSE=$(curl -k -L -X POST \
+      "http://localhost:8080/api/v1/clusters/$DOUBLE_ENCODED_SERVER/invalidate-cache" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $TOKEN" \
+      -d '{}' \
+      -w "\nHTTP_STATUS:%{http_code}" \
+      --fail-with-body 2>/dev/null || echo "CACHE_INVALIDATION_FAILED")
+
+    if [[ "$RESPONSE" == *"CACHE_INVALIDATION_FAILED"* ]]; then
+      echo "⚠️ Cache invalidation API call failed"
+    else
+      echo "✅ Cache invalidation API response:"
+      echo "$RESPONSE"
+    fi
+  else
+    echo "⚠️ Could not extract token from login response"
+  fi
 fi
-echo "   - 'Failed to load target state'"
-echo "   - 'failed to sync cluster cache'"
+
 echo ""
-echo "🔍 Key difference: CRD now has orphaned owner references to deleted ProviderRevision"
-echo "   This simulates the real Crossplane scenario from the incident"
+echo "🔄 Method 2: Force application refresh (triggers cache rebuild)"
+kubectl patch application external-cluster-app -n argocd --type='merge' -p='{"operation":{"initiatedBy":{"username":"admin"},"info":[{"name":"reason","value":"force-refresh-after-crd-evolution"}]}}' || echo "Patch failed - this is expected"
+
+echo ""
+echo "📊 Step 7: Check application status for cluster-wide failure"
+echo "All applications targeting the cluster should now show errors..."
+
+kubectl get applications -n argocd
+
+echo ""
+echo "🔥 CRD Evolution Webhook Failure Complete!"
+echo "==========================================="
+echo ""
+echo "🎯 What just happened:"
+echo "1. ✅ Checked current state (may have been already broken - script continues)"
+echo "2. 🗑️  Removed webhook service application (simulating service unavailability)"
+echo "3. 🔥 Updated CRD to add conversion webhook pointing to non-existent service"
+echo "4. 💥 All API access to the CRD now fails due to broken webhook"
+echo "5. 🌊 Argo CD cache refresh discovers the broken state"
+echo "6. ❌ ALL applications in target cluster should now show errors"
+echo ""
+echo "🧠 Key Mechanism: v1 is storage version, v2 is served"
+echo "   • When Argo CD accesses any CRD resource, Kubernetes must convert"
+echo "   • from v1 (storage) to v2 (served) or vice versa"
+echo "   • This triggers the conversion webhook for EVERY resource access"
+echo "   • With webhook broken, ALL CRD operations fail cluster-wide"
+echo ""
+echo "🔍 Check for the target error patterns:"
+echo "kubectl logs -l app.kubernetes.io/name=argocd-application-controller -n argocd --tail=50"
+echo ""
+echo "📱 Check application status:"
+echo "kubectl get applications -n argocd"
+echo "kubectl describe application external-cluster-app -n argocd"
+echo ""
+echo "🌐 Check Argo CD UI (if port-forward is running):"
+echo "http://localhost:8080 - all apps targeting the cluster should be 'Unknown' status"
+echo ""
+echo "🔍 Expected error patterns:"
+echo "- 'Failed to load target state'"
+echo "- 'conversion webhook for conversion.example.com/v1, Kind=Example failed'"
+echo "- 'service \"conversion-webhook-service\" not found'"
+echo "- Applications show 'Unknown' health status"
+echo ""
+echo "🔄 Script is idempotent - can be run multiple times safely"
+echo "🛠️  Run './scripts/fix.sh' to restore functionality via Argo CD"

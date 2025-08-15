@@ -4,74 +4,210 @@ set -e
 # Change to project root directory (one level up from scripts)
 cd "$(dirname "$0")/.."
 
-echo "� Restoring Conversion Webhook Functionality"
-echo "============================================="
+echo "🛠️  Restoring CRD Functionality After Evolution Failure"
+echo "======================================================="
 
-# Check what type of failure we created
-if [ -f /tmp/webhook-failure-type ]; then
-    FAILURE_TYPE=$(cat /tmp/webhook-failure-type)
-    echo "� Detected failure type: $FAILURE_TYPE"
-else
-    echo "⚠️  No failure type detected. Assuming service selector was broken."
-    FAILURE_TYPE="no-endpoints"
-fi
+echo "🎯 Switching to Argo CD cluster..."
+kubectl config use-context kind-argocd-cluster
 
-echo "� Switching to target cluster..."
-kubectl config use-context kind-target-cluster
+echo "🔍 Current broken state:"
+echo "• CRD has conversion webhook pointing to non-existent service"
+echo "• All API access to the CRD fails"
+echo "• Argo CD applications show 'Unknown' status"
 
-case $FAILURE_TYPE in
-    "service-deleted")
-        echo "� Recreating webhook service..."
-        kubectl apply -f manifests/webhook-deployment.yaml
+echo ""
+echo "🛠️  Choose restoration method:"
+echo "1) Deploy working conversion webhook service via Argo CD (GitOps approach)"
+echo "2) Remove conversion webhook (revert to no-conversion state)"
+echo "3) Deploy webhook service directly in target cluster (non-GitOps)"
+read -p "Enter choice (1, 2, or 3): " choice
+
+case $choice in
+    1)
+        echo "🎯 Option 1: Deploying working conversion webhook via Argo CD..."
+        echo "This demonstrates GitOps restoration of the webhook service"
+
+        # Get target server details for the application
+        TARGET_SERVER_RAW=$(kubectl config view --context=kind-target-cluster -o jsonpath='{.clusters[?(@.name=="kind-target-cluster")].cluster.server}')
+        TARGET_CONTAINER_IP=$(docker inspect target-cluster-control-plane --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+        TARGET_SERVER="https://${TARGET_CONTAINER_IP}:6443"
+
+        echo "🔨 Building and loading webhook server image..."
+        docker build -t webhook-conversion:latest .
+        kind load docker-image webhook-conversion:latest --name target-cluster
+
+        echo "🔐 Generating TLS certificates for the webhook..."
+        mkdir -p /tmp/webhook-certs
+        cd /tmp/webhook-certs
+
+        openssl genrsa -out ca.key 2048
+        openssl req -new -x509 -days 365 -key ca.key -out ca.crt -subj "/C=CA/ST=Province/O=Example"
+        openssl genrsa -out tls.key 2048
+        openssl req -new -key tls.key -out server.csr -subj "/C=CA/ST=Province/O=Example" -addext "subjectAltName=DNS:conversion-webhook-service.webhook-system.svc,DNS:conversion-webhook-service.webhook-system.svc.cluster.local"
+        openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out tls.crt -days 365 -extensions v3_req -extfile <(echo -e "[ v3_req ]\nsubjectAltName=DNS:conversion-webhook-service.webhook-system.svc,DNS:conversion-webhook-service.webhook-system.svc.cluster.local")
+
+        kubectl config use-context kind-target-cluster
+        kubectl create secret tls webhook-certs \
+          --cert=tls.crt \
+          --key=tls.key \
+          -n webhook-system --dry-run=client -o yaml | kubectl apply -f -
+
+        CA_BUNDLE=$(cat ca.crt | base64 | tr -d '\n')
+
+        # Update CRD with correct CA bundle FIRST
+        echo "🔧 Patching CRD with CA bundle..."
+        kubectl patch crd examples.conversion.example.com --type='merge' -p='{"spec":{"conversion":{"webhook":{"clientConfig":{"caBundle":"'$CA_BUNDLE'"}}}}}'
+
+        cd -
+
+        # Deploy webhook service directly FIRST to break the chicken-and-egg problem
+        echo "🚀 Deploying webhook service directly to break the deadlock..."
+        kubectl apply -f webhook-service-managed/resources.yaml
+
+        echo "⏳ Waiting for webhook pod to be ready..."
+        kubectl wait --for=condition=ready pod -l app=conversion-webhook -n webhook-system --timeout=120s
+
+        echo "✅ Webhook service is now functional - cluster cache should recover"
+
+        echo "🔄 Switching back to Argo CD cluster..."
+        kubectl config use-context kind-argocd-cluster
+
+        # Invalidate cluster cache to speed up recovery
+        echo "🔄 Invalidating cluster cache to accelerate recovery..."
+        DOUBLE_ENCODED_SERVER=$(echo "$TARGET_SERVER" | sed 's/:/%253A/g' | sed 's/\//%252F/g')
+        curl -k -X POST \
+          "http://localhost:8080/api/v1/clusters/$DOUBLE_ENCODED_SERVER/invalidate-cache" \
+          -H "Content-Type: application/json" \
+          -d '{}' \
+          --fail-with-body || echo "⚠️ Cache invalidation may have failed - cache will refresh automatically"
+
+        # NOW create the Argo CD application for ongoing GitOps management
+        echo "📱 Creating Argo CD application for ongoing webhook service management..."
+        sed "s|TARGET_SERVER_PLACEHOLDER|$TARGET_SERVER|g" manifests/webhook-service-app.yaml | kubectl apply -f -
+
+        # Provide URL for manual cache invalidation if needed
+        ENCODED_TARGET_SERVER=$(echo "$TARGET_SERVER" | sed 's/:/%3A/g' | sed 's/\//%2F/g')
+        echo ""
+        echo "💡 If this step takes too long, you can manually invalidate the cluster cache:"
+        echo "   Argo CD Cluster Page: http://localhost:8080/settings/clusters/$ENCODED_TARGET_SERVER"
+        echo "   Click 'Invalidate Cache' button on the cluster page"
+        echo ""
+
+        echo "⏳ Waiting for Argo CD to recognize and sync the existing resources..."
+        kubectl wait --for=jsonpath='{.status.sync.status}'=Synced application/webhook-service-app -n argocd --timeout=120s || echo "⚠️ App may take time to sync - resources are already deployed"
         ;;
-    "no-endpoints")
-        echo "� Fixing service selector..."
-        kubectl patch service conversion-webhook-service -n webhook-system --type='merge' -p='{"spec":{"selector":{"app":"conversion-webhook"}}}'
+
+    2)
+        echo "🔄 Option 2: Reverting CRD to no-conversion state..."
+        kubectl config use-context kind-target-cluster
+        kubectl apply -f manifests/crd-no-conversion.yaml
+        echo "✅ CRD reverted to no-conversion state"
         ;;
+
+    3)
+        echo "🔧 Option 3: Deploy webhook directly in target cluster..."
+        kubectl config use-context kind-target-cluster
+
+        # Build and load image
+        docker build -t webhook-conversion:latest .
+        kind load docker-image webhook-conversion:latest --name target-cluster
+
+        # Generate certificates and deploy webhook
+        mkdir -p /tmp/webhook-certs
+        cd /tmp/webhook-certs
+
+        openssl genrsa -out ca.key 2048
+        openssl req -new -x509 -days 365 -key ca.key -out ca.crt -subj "/C=CA/ST=Province/O=Example"
+        openssl genrsa -out tls.key 2048
+        openssl req -new -key tls.key -out server.csr -subj "/C=CA/ST=Province/O=Example" -addext "subjectAltName=DNS:nonexistent-webhook-service.webhook-system.svc,DNS:nonexistent-webhook-service.webhook-system.svc.cluster.local"
+        openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out tls.crt -days 365 -extensions v3_req -extfile <(echo -e "[ v3_req ]\nsubjectAltName=DNS:nonexistent-webhook-service.webhook-system.svc,DNS:nonexistent-webhook-service.webhook-system.svc.cluster.local")
+
+        kubectl create secret tls webhook-certs \
+          --cert=tls.crt \
+          --key=tls.key \
+          -n webhook-system --dry-run=client -o yaml | kubectl apply -f -
+
+        CA_BUNDLE=$(cat ca.crt | base64 | tr -d '\n')
+        kubectl patch crd examples.conversion.example.com --type='merge' -p='{"spec":{"conversion":{"webhook":{"clientConfig":{"caBundle":"'$CA_BUNDLE'"}}}}}'
+
+        # Deploy webhook using the existing GitOps manifest directly
+        kubectl apply -f webhook-service-managed/resources.yaml
+
+        cd -
+        echo "⏳ Waiting for webhook pod to be ready..."
+        kubectl wait --for=condition=ready pod -l app=conversion-webhook -n webhook-system --timeout=120s
+        ;;
+
     *)
-        echo "� Attempting to fix service selector..."
-        kubectl patch service conversion-webhook-service -n webhook-system --type='merge' -p='{"spec":{"selector":{"app":"conversion-webhook"}}}'
+        echo "❌ Invalid choice. Using option 2 (revert to no-conversion)..."
+        kubectl config use-context kind-target-cluster
+        kubectl apply -f manifests/crd-no-conversion.yaml
         ;;
 esac
 
-echo "⏳ Waiting for webhook pod to be ready..."
-kubectl wait --for=condition=ready pod -l app=conversion-webhook -n webhook-system --timeout=60s
+echo ""
+echo "✅ Verifying CRD functionality restored..."
+kubectl config use-context kind-target-cluster
+kubectl get crd examples.conversion.example.com
 
-echo "✅ Verifying webhook functionality in target cluster..."
-kubectl get svc -n webhook-system
-kubectl get endpoints conversion-webhook-service -n webhook-system
+echo "🔍 Testing API access..."
 kubectl get examples.v1.conversion.example.com
+kubectl get examples.v2.conversion.example.com
+kubectl get examples
+
+echo "📋 Testing resource creation..."
 kubectl apply -f manifests/test-resources.yaml
 
-echo "� Switching to Argo CD cluster..."
+echo ""
+echo "🔄 Switching to Argo CD cluster..."
 kubectl config use-context kind-argocd-cluster
 
-echo "♻️  Restarting Argo CD components to clear error states..."
-kubectl rollout restart deployment/argocd-server -n argocd
-kubectl rollout restart deployment/argocd-repo-server -n argocd
-kubectl rollout restart statefulset/argocd-application-controller -n argocd
+echo "♻️  Triggering Argo CD cache refresh and application resync..."
 
-echo "⏳ Waiting for restarts to complete..."
-kubectl rollout status deployment/argocd-server -n argocd
-kubectl rollout status deployment/argocd-repo-server -n argocd
-kubectl rollout status statefulset/argocd-application-controller -n argocd
+# Invalidate cluster cache to ensure Argo CD sees the fixed state
+TARGET_SERVER_RAW=$(kubectl config view --context=kind-target-cluster -o jsonpath='{.clusters[?(@.name=="kind-target-cluster")].cluster.server}')
+TARGET_CONTAINER_IP=$(docker inspect target-cluster-control-plane --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+TARGET_SERVER="https://${TARGET_CONTAINER_IP}:6443"
+DOUBLE_ENCODED_SERVER=$(echo "$TARGET_SERVER" | sed 's/:/%253A/g' | sed 's/\//%252F/g')
 
-echo "� Triggering application resync..."
+# Invalidate cluster cache to ensure Argo CD sees the recovery
+echo "🔄 Invalidating cluster cache to ensure Argo CD sees the recovery..."
+
+# Get the admin password and authenticate
+ADMIN_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+LOGIN_RESPONSE=$(curl -k -X POST \
+  "http://localhost:8080/api/v1/session" \
+  -H "Content-Type: application/json" \
+  -d "{\"username\":\"admin\",\"password\":\"$ADMIN_PASSWORD\"}" \
+  --fail-with-body 2>/dev/null || echo "LOGIN_FAILED")
+
+if [[ "$LOGIN_RESPONSE" != *"LOGIN_FAILED"* ]]; then
+  TOKEN=$(echo "$LOGIN_RESPONSE" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+  if [[ -n "$TOKEN" ]]; then
+    curl -k -L -X POST \
+      "http://localhost:8080/api/v1/clusters/$DOUBLE_ENCODED_SERVER/invalidate-cache" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $TOKEN" \
+      -d '{}' \
+      --fail-with-body || echo "⚠️ Cache invalidation may have failed - applications will recover automatically"
+  fi
+else
+  echo "⚠️ Authentication failed - applications will recover automatically"
+fi
+
+echo "🔄 Triggering application resync..."
 kubectl patch application external-cluster-app -n argocd --type='merge' -p='{"operation":{"initiatedBy":{"username":"admin"},"sync":{"revision":"HEAD"}}}' || true
-kubectl patch application cluster-discovery-trigger -n argocd --type='merge' -p='{"operation":{"initiatedBy":{"username":"admin"},"sync":{"revision":"HEAD"}}}' || true
+kubectl patch application webhook-test-external -n argocd --type='merge' -p='{"operation":{"initiatedBy":{"username":"admin"},"sync":{"revision":"HEAD"}}}' || true
 
-echo "⏳ Waiting a moment for sync to complete..."
-sleep 10
+echo "⏳ Waiting for sync to complete..."
+sleep 15
 
 echo "✅ Checking application recovery..."
 kubectl get applications -n argocd
 
-# Clean up temp file
-rm -f /tmp/webhook-failure-type
-
 echo ""
-echo "� Webhook restoration complete!"
-echo "================================"
+echo "🎉 CRD Evolution Fix Complete!"
+echo "=============================="
 echo ""
 echo "✅ Verification steps:"
 echo "1. Check Argo CD Dashboard: http://localhost:8080 (if port-forward is running)"
@@ -79,7 +215,23 @@ echo "2. Application status: kubectl get applications -n argocd"
 echo "3. Target cluster resources:"
 echo "   kubectl config use-context kind-target-cluster"
 echo "   kubectl get examples"
-echo "   kubectl get all -n guestbook-external"
+echo "   kubectl get all -n webhook-system"
 echo ""
-echo "� Applications should return to healthy/synced status"
-echo "� If applications still show errors, wait a few minutes and check again"
+echo "🎯 Applications should return to Synced/Healthy status"
+echo "🔄 You can now run './scripts/break.sh' again to test the cycle"
+echo ""
+echo "🧠 What happened:"
+if [ "$choice" = "1" ]; then
+    echo "   • Direct kubectl deployment broke the chicken-and-egg deadlock"
+    echo "   • Argo CD Application created for ongoing GitOps management"
+    echo "   • Conversion webhook is now functional"
+    echo "   • All CRD operations work normally"
+elif [ "$choice" = "2" ]; then
+    echo "   • CRD reverted to no-conversion strategy"
+    echo "   • Both API versions work without webhooks"
+    echo "   • Simpler but loses conversion capability"
+else
+    echo "   • Webhook service deployed directly using existing GitOps manifest"
+    echo "   • Conversion webhook is now functional"
+    echo "   • All CRD operations work normally"
+fi

@@ -1,0 +1,57 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: examples.conversion.example.com
+spec:
+  group: conversion.example.com
+  versions:
+    - name: v1
+      served: true
+      storage: true  # v1 remains the storage version
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                field1:
+                  type: string
+            status:
+              type: object
+    - name: v2
+      served: true
+      storage: false  # v2 is served but not storage
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                field1:
+                  type: string
+                field2:
+                  type: string
+            status:
+              type: object
+  scope: Namespaced
+  names:
+    plural: examples
+    singular: example
+    kind: Example
+  # Conversion webhook pointing to the actual service created by fix.sh
+  # When break.sh runs, this service won't exist yet, causing the failure
+  # When fix.sh runs, this service gets created, restoring functionality
+  conversion:
+    strategy: Webhook
+    webhook:
+      clientConfig:
+        service:
+          name: conversion-webhook-service
+          namespace: webhook-system
+          path: /convert
+        # No caBundle - fix.sh will patch this with the correct certificate
+      conversionReviewVersions:
+        - v1
+        - v1beta1
