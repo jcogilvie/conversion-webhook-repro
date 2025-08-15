@@ -17,7 +17,6 @@ metadata:
     managed-by: argocd
 spec:
   field1: "argocd-managed-v2-resource"
-  field2: "managed-by-argocd"
 ---
 apiVersion: v1
 kind: ConfigMap
