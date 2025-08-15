@@ -36,12 +36,28 @@ kubectl config use-context kind-argocd-cluster
 
 echo "🗑️  Step 2: Remove webhook service application if it exists"
 echo "This simulates the webhook service being unavailable/deleted"
-kubectl delete application webhook-service-app -n argocd || echo "✅ Webhook service app doesn't exist (expected for first run)"
+
+# Check if the application exists before trying to delete it
+if kubectl get application webhook-service-app -n argocd >/dev/null 2>&1; then
+  echo "📱 Webhook service application found, deleting..."
+  kubectl delete application webhook-service-app -n argocd
+
+  echo "⏳ Waiting for application deletion to complete (due to finalizers)..."
+  # Wait for the application to be completely removed
+  while kubectl get application webhook-service-app -n argocd >/dev/null 2>&1; do
+    echo "   Application still exists, waiting for finalizer cleanup..."
+    sleep 5
+  done
+  echo "✅ Webhook service application completely removed"
+
+  echo "⏳ Waiting for Argo CD to clean up webhook service resources in target cluster..."
+  # Give Argo CD a moment to process the deletion and clean up resources
+  sleep 5
+else
+  echo "✅ Webhook service app doesn't exist (expected for first run)"
+fi
 
 echo ""
-echo "⏳ Waiting for Argo CD to clean up webhook service resources..."
-sleep 10
-
 # Verify the webhook service is gone from target cluster
 kubectl config use-context kind-target-cluster
 echo "🔍 Verifying webhook service removal..."
@@ -88,7 +104,6 @@ DOUBLE_ENCODED_SERVER=$(echo "$TARGET_SERVER" | sed 's/:/%253A/g' | sed 's/\//%2
 echo "🔄 Method 1: Invalidate cluster cache via Argo CD API (with authentication)"
 echo "Using cluster: $TARGET_SERVER"
 
-# Check if port-forward is running by testing connectivity
 echo "🔍 Checking Argo CD API connectivity..."
 if curl -k -s --connect-timeout 3 "https://localhost:8080/api/version" > /dev/null 2>&1; then
   echo "✅ Argo CD API is accessible at localhost:8080"
@@ -98,11 +113,9 @@ if curl -k -s --connect-timeout 3 "https://localhost:8080/api/version" > /dev/nu
 
   # First, login to get a session token
   echo "🔐 Authenticating with Argo CD..."
-  echo "🔍 Admin password length: ${#ADMIN_PASSWORD}"
 
   # Create JSON payload properly
   JSON_PAYLOAD=$(printf '{"username":"admin","password":"%s"}' "$ADMIN_PASSWORD")
-  echo "🔍 JSON payload prepared (length: ${#JSON_PAYLOAD})"
 
   # Try authentication using HTTPS
   echo "🔄 Attempting login via HTTPS..."
@@ -110,10 +123,7 @@ if curl -k -s --connect-timeout 3 "https://localhost:8080/api/version" > /dev/nu
     "https://localhost:8080/api/v1/session" \
     -H "Content-Type: application/json" \
     -d "$JSON_PAYLOAD" \
-    -w "\nHTTP_STATUS:%{http_code}" \
     2>/dev/null || echo 'CURL_FAILED')
-
-  echo "🔍 Login response: $LOGIN_RESPONSE"
 
   # Check if login was successful and extract token
   if echo "$LOGIN_RESPONSE" | grep -q '"token"'; then
@@ -121,7 +131,6 @@ if curl -k -s --connect-timeout 3 "https://localhost:8080/api/version" > /dev/nu
 
     if [[ -n "$TOKEN" && "$TOKEN" != "null" ]]; then
       echo "✅ Authentication successful"
-      echo "🔑 Token extracted (length: ${#TOKEN})"
 
       # Now call the cache invalidation API with the token
       echo "🔄 Calling cache invalidation API..."
@@ -130,21 +139,35 @@ if curl -k -s --connect-timeout 3 "https://localhost:8080/api/version" > /dev/nu
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $TOKEN" \
         -d '{}' \
-        -w "\nHTTP_STATUS:%{http_code}" 2>/dev/null || echo "CACHE_INVALIDATION_FAILED")
+        2>/dev/null || echo "CACHE_INVALIDATION_FAILED")
 
       if [[ "$RESPONSE" == *"CACHE_INVALIDATION_FAILED"* ]]; then
         echo "⚠️ Cache invalidation API call failed"
       else
         echo "✅ Cache invalidation successful"
-        echo "$RESPONSE"
+
+        # Parse the response to check cluster connection state
+        if echo "$RESPONSE" | grep -q '"status":"Failed"'; then
+          CONNECTION_MESSAGE=$(echo "$RESPONSE" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
+          if echo "$CONNECTION_MESSAGE" | grep -q "conversion-webhook-service.*not found"; then
+            echo "🎯 Confirmed: Argo CD detected the broken conversion webhook"
+            echo "   Error: conversion webhook service not found"
+          elif echo "$CONNECTION_MESSAGE" | grep -q "conversion webhook.*failed"; then
+            echo "🎯 Confirmed: Argo CD detected conversion webhook failure"
+          else
+            echo "🔍 Cluster connection failed for different reason:"
+            echo "   $(echo "$CONNECTION_MESSAGE" | sed 's/\\"/"/g')"
+          fi
+        else
+          echo "⚠️ Expected cluster connection failure but cluster appears healthy"
+          echo "   The webhook break may not have taken effect yet"
+        fi
       fi
     else
       echo "⚠️ Could not extract token from login response"
-      echo "Response: $LOGIN_RESPONSE"
     fi
   else
     echo "⚠️ Login failed or invalid response"
-    echo "Full response: $LOGIN_RESPONSE"
     echo ""
     echo "🔍 Debugging steps:"
     echo "1. Verify port-forward is working: curl -k https://localhost:8080/api/version"
@@ -160,8 +183,8 @@ else
   echo "🔄 Alternative: Manual cache invalidation via UI"
   ENCODED_TARGET_SERVER=$(echo "$TARGET_SERVER" | sed 's/:/%3A/g' | sed 's/\//%2F/g')
   echo "   1. Start port-forward: kubectl port-forward svc/argocd-server -n argocd 8080:443 &"
-  echo "   2. Access Argo CD: http://localhost:8080"
-  echo "   3. Navigate to cluster settings: http://localhost:8080/settings/clusters/$ENCODED_TARGET_SERVER"
+  echo "   2. Access Argo CD: https://localhost:8080"
+  echo "   3. Navigate to cluster settings: https://localhost:8080/settings/clusters/$ENCODED_TARGET_SERVER"
   echo "   4. Click 'Invalidate Cache' button"
   echo ""
   echo "📋 For now, continuing with application refresh method..."
@@ -203,7 +226,7 @@ echo "kubectl get applications -n argocd"
 echo "kubectl describe application external-cluster-app -n argocd"
 echo ""
 echo "🌐 Check Argo CD UI (if port-forward is running):"
-echo "http://localhost:8080 - all apps targeting the cluster should be 'Unknown' status"
+echo "https://localhost:8080 - all apps targeting the cluster should be 'Unknown' status"
 echo ""
 echo "🔍 Expected error patterns:"
 echo "- 'Failed to load target state'"
@@ -212,4 +235,4 @@ echo "- 'service \"conversion-webhook-service\" not found'"
 echo "- Applications show 'Unknown' health status"
 echo ""
 echo "🔄 Script is idempotent - can be run multiple times safely"
-echo "🛠️  Run './scripts/fix.sh' to restore functionality via Argo CD"
+echo "🛠️  Run './scripts/fix.sh' to restore functionality via Argo"

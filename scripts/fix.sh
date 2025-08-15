@@ -40,22 +40,36 @@ case $choice in
         mkdir -p /tmp/webhook-certs
         cd /tmp/webhook-certs
 
+        # Generate CA private key
         openssl genrsa -out ca.key 2048
+
+        # Generate CA certificate
         openssl req -new -x509 -days 365 -key ca.key -out ca.crt -subj "/C=CA/ST=Province/O=Example"
+
+        # Generate server private key
         openssl genrsa -out tls.key 2048
+
+        # Create certificate signing request
         openssl req -new -key tls.key -out server.csr -subj "/C=CA/ST=Province/O=Example" -addext "subjectAltName=DNS:conversion-webhook-service.webhook-system.svc,DNS:conversion-webhook-service.webhook-system.svc.cluster.local"
+
+        # Generate server certificate
         openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out tls.crt -days 365 -extensions v3_req -extfile <(echo -e "[ v3_req ]\nsubjectAltName=DNS:conversion-webhook-service.webhook-system.svc,DNS:conversion-webhook-service.webhook-system.svc.cluster.local")
 
         kubectl config use-context kind-target-cluster
+
+        # Delete existing secret if it exists to ensure clean state
+        kubectl delete secret webhook-certs -n webhook-system || true
+
+        # Create the secret with our newly generated certificates
         kubectl create secret tls webhook-certs \
           --cert=tls.crt \
           --key=tls.key \
-          -n webhook-system --dry-run=client -o yaml | kubectl apply -f -
+          -n webhook-system
 
         CA_BUNDLE=$(base64 -w 0 < ca.crt)
 
-        # Update CRD with correct CA bundle FIRST
-        echo "🔧 Patching CRD with CA bundle..."
+        # Update CRD with the SAME CA bundle that signed our server certificate
+        echo "🔧 Patching CRD with matching CA bundle..."
         kubectl patch crd examples.conversion.example.com --type='merge' -p "{\"spec\":{\"conversion\":{\"webhook\":{\"clientConfig\":{\"caBundle\":\"$CA_BUNDLE\"}}}}}"
 
         cd -
@@ -95,11 +109,34 @@ case $choice in
             if [[ -n "$TOKEN" && "$TOKEN" != "null" ]]; then
               echo "✅ Authentication successful, invalidating cache..."
 
-              curl -k -s -L -X POST \
+              CACHE_RESPONSE=$(curl -k -s -L -X POST \
                 "https://localhost:8080/api/v1/clusters/$DOUBLE_ENCODED_SERVER/invalidate-cache" \
                 -H "Content-Type: application/json" \
                 -H "Authorization: Bearer $TOKEN" \
-                -d '{}' > /dev/null && echo "✅ Cache invalidated successfully" || echo "⚠️ Cache invalidation may have failed - cache will refresh automatically"
+                -d '{}' \
+                2>/dev/null || echo "CACHE_INVALIDATION_FAILED")
+
+              if [[ "$CACHE_RESPONSE" == *"CACHE_INVALIDATION_FAILED"* ]]; then
+                echo "⚠️ Cache invalidation may have failed - cache will refresh automatically"
+              else
+                echo "✅ Cache invalidated successfully"
+
+                # Parse the response to check if the cluster is now healthy
+                if echo "$CACHE_RESPONSE" | grep -q '"status":"Successful"'; then
+                  echo "🎯 Confirmed: Cluster connection restored - webhook is working"
+                elif echo "$CACHE_RESPONSE" | grep -q '"status":"Failed"'; then
+                  CONNECTION_MESSAGE=$(echo "$CACHE_RESPONSE" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
+                  if echo "$CONNECTION_MESSAGE" | grep -q "conversion webhook.*failed"; then
+                    echo "⚠️ Webhook failure still detected - fix may need more time"
+                    echo "   Error: $(echo "$CONNECTION_MESSAGE" | sed 's/\\"/"/g')"
+                  else
+                    echo "🔍 Different cluster issue detected:"
+                    echo "   $(echo "$CONNECTION_MESSAGE" | sed 's/\\"/"/g')"
+                  fi
+                else
+                  echo "📊 Cache invalidated - cluster state will be refreshed on next sync"
+                fi
+              fi
             else
               echo "⚠️ Could not extract token - cache will refresh automatically"
             fi

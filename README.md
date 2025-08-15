@@ -1,6 +1,45 @@
 # Kubernetes CRD Conversion Webhook Failure Reproduction
 
-This reproduction case demonstrates the failure scenario where a CRD conversion webhook service becomes unavailable, causing `kubectl get crd` operations to fail, as described in [Argo CD issue #20828](https://github.com/argoproj/argo-cd/issues/20828).
+This reproduction case demonstrates the cluster-wide failure scenario that occurs when CRDs evolve to include conversion
+webhooks that become unavailable, causing all applications in a target cluster to show "Unknown" status in Argo CD, as
+described in [Argo CD issue #20828](https://github.com/argoproj/argo-cd/issues/20828).
+
+## Reproduction Approach
+
+This reproduction simulates a **realistic CRD evolution scenario** that triggers **cluster-wide failure**:
+
+1. **Initial State**: CRD exists with multiple API versions (v1 storage, v2 served) but **no conversion webhook**
+2. **Resources Created**: Applications create resources in both API versions successfully
+3. **CRD Evolution**: CRD is updated to add a conversion webhook pointing to a non-existent service
+4. **Cluster-Wide Failure**: Argo CD cache invalidation discovers the broken webhook, causing **all applications** in
+   the target cluster to fail
+
+## 🧠 **Critical Mechanism: Why This Causes Cluster-Wide Failure**
+
+The key insight is the **storage vs served version configuration**:
+
+- **v1 is the storage version** - all resources are stored in etcd as v1
+- **v2 is served** - the API server offers both v1 and v2 APIs
+- **When any client accesses the CRD** (even v1 resources), Kubernetes may need to convert between versions
+- **Argo CD's cluster cache** builds by discovering all API resources, triggering conversions
+- **With the webhook broken**, every conversion attempt fails, breaking the entire cluster cache
+
+### Why Previous Reproductions Failed
+
+Earlier attempts typically used v2 as storage version, which meant:
+
+- v1 API access worked without conversion (no webhook needed)
+- Only v2-specific operations failed
+- Argo CD could still build cluster cache and manage most resources
+
+**Our approach**: v1 storage + v2 served + broken webhook = **mandatory conversion for all operations** = cluster-wide
+failure.
+
+This mirrors real-world scenarios where:
+
+- CRDs evolve from simple multi-version to requiring conversion webhooks
+- Webhook services become unavailable after CRD updates
+- The failure cascades to affect all cluster resources, not just the specific CRD
 
 ## Prerequisites
 
@@ -13,340 +52,276 @@ This reproduction case demonstrates the failure scenario where a CRD conversion 
 
 This project includes all necessary files to reproduce the webhook failure scenario.
 
-### Step 1: Create a Kind Cluster
+### Step 1: Run the Setup Script
 
 ```bash
-# Create a new kind cluster
-kind create cluster --name webhook-test --image kindest/node:v1.32.5@sha256:e3b2327e3a5ab8c76f5ece68936e4cafaa82edf58486b769727ab0b3b97a5b0d
-
-# Verify cluster is running
-kubectl cluster-info --context kind-webhook-test
+# This creates clusters, installs Argo CD, and sets up the initial CRD without conversion webhook
+./scripts/setup.sh
 ```
 
-### Step 2: Build and Load the Webhook Server
+**What the setup script does:**
 
-```bash
-# Build the webhook server image
-docker build -t webhook-conversion:latest .
+1. **Creates two Kind clusters**: `argocd-cluster` (management) and `target-cluster` (target for applications)
+2. **Installs Argo CD** in the management cluster with self-management enabled
+3. **Creates initial CRD** with v1 (storage) and v2 (served) versions **without** conversion webhook
+4. **Creates test resources** in both API versions to verify functionality
+5. **Registers target cluster** with Argo CD using service account authentication
+6. **Creates cross-cluster applications** that deploy resources to the target cluster
+7. **Verifies initial sync** and waits for applications to be healthy
 
-# Load the image into the kind cluster
-kind load docker-image webhook-conversion:latest --name webhook-test
-```
+The script is **idempotent** and can be run multiple times safely.
 
-### Step 3: Create the Webhook Service Namespace
-
-```bash
-kubectl create namespace webhook-system
-```
-
-### Step 4: Apply the CRD with Conversion Webhook
-
-```bash
-kubectl apply -f manifests/crd-with-webhook.yaml
-```
-
-### Step 5: Generate TLS Certificates for the Webhook
-
-```bash
-# Create a temporary directory for certs
-mkdir -p /tmp/webhook-certs
-cd /tmp/webhook-certs
-
-# Generate CA private key
-openssl genrsa -out ca.key 2048
-
-# Generate CA certificate
-openssl req -new -x509 -days 365 -key ca.key -out ca.crt -subj "/C=CA/ST=Province/O=Example"
-
-# Generate server private key
-openssl genrsa -out tls.key 2048
-
-# Create certificate signing request
-openssl req -new -key tls.key -out server.csr -subj "/C=CA/ST=Province/O=Example" -addext "subjectAltName=DNS:conversion-webhook-service.webhook-system.svc,DNS:conversion-webhook-service.webhook-system.svc.cluster.local"
-
-# Generate server certificate
-openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out tls.crt -days 365 -extensions v3_req -extfile <(echo -e "[ v3_req ]\nsubjectAltName=DNS:conversion-webhook-service.webhook-system.svc,DNS:conversion-webhook-service.webhook-system.svc.cluster.local")
-
-# Create Kubernetes secret with the certificates
-kubectl create secret tls webhook-certs \
-  --cert=tls.crt \
-  --key=tls.key \
-  -n webhook-system
-
-# Update the CRD with the correct CA bundle
-CA_BUNDLE=$(cat ca.crt | base64 | tr -d '\n')
-kubectl patch crd examples.conversion.example.com --type='merge' -p='{"spec":{"conversion":{"webhook":{"clientConfig":{"caBundle":"'$CA_BUNDLE'"}}}}}'
-
-# Return to project directory
-cd -
-```
-
-### Step 6: Deploy the Webhook Service
-
-```bash
-kubectl apply -f manifests/webhook-deployment.yaml
-```
-
-### Step 7: Verify Everything Works Initially
-
-```bash
-# Wait for the webhook pod to be ready
-kubectl wait --for=condition=ready pod -l app=conversion-webhook -n webhook-system --timeout=60s
-
-# Test that CRD retrieval works
-kubectl get crd examples.conversion.example.com
-
-# Create test resources
-kubectl apply -f manifests/test-resources.yaml
-
-# Verify the resources were created and conversion works
-kubectl get examples test-example-v1 -o yaml
-kubectl get examples test-example-v2 -o yaml
-
-# Test conversion by getting both in different API versions
-kubectl get examples test-example-v1 -o jsonpath='{.apiVersion}' && echo
-kubectl get examples test-example-v2 -o jsonpath='{.apiVersion}' && echo
-```
-
-### Step 8: Install Argo CD to Observe the Failure
-
-Now let's install Argo CD to demonstrate how this webhook failure affects real applications:
-
-```bash
-# Add the Argo CD Helm repository
-helm repo add argo https://argoproj.github.io/argo-helm
-helm repo update
-
-# Create a namespace for Argo CD
-kubectl create namespace argocd
-
-# Install Argo CD via Helm
-helm install argocd argo/argo-cd \
-  --namespace argocd \
-  --set server.service.type=ClusterIP \
-  --set configs.params."server.insecure"=true \
-  --version 7.6.10
-
-# Wait for Argo CD to be ready
-kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-server -n argocd --timeout=300s
-```
-
-### Step 9: Access Argo CD Dashboard
+### Step 2: Access Argo CD Dashboard
 
 ```bash
 # Get the initial admin password
+kubectl config use-context kind-argocd-cluster
 kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d && echo
 
 # Port forward to access the Argo CD dashboard
 kubectl port-forward svc/argocd-server -n argocd 8080:443 &
 
-# Note: The dashboard will be available at http://localhost:8080
+# Access the dashboard at https://localhost:8080
 # Username: admin
 # Password: (output from the command above)
 ```
 
-Keep this port-forward running in the background. You can now access the Argo CD dashboard at http://localhost:8080
+**Verify Initial State**: In the Argo CD dashboard, you should see applications successfully synced to the target
+cluster.
 
-### Step 10: Create Argo CD Applications
-
-Create Argo CD applications that will be affected by the webhook failure:
-
-```bash
-# Apply the Argo CD applications
-kubectl apply -f manifests/argocd-applications.yaml
-```
-
-Wait for the applications to appear in the Argo CD dashboard, then proceed to the next step.
-
-### Step 11: Simulate Webhook Service Failure
-
-The most effective way to reproduce the webhook failure is to delete the service:
+### Step 3: Simulate CRD Evolution with Broken Webhook
 
 ```bash
-# Delete the webhook service entirely
-kubectl delete service conversion-webhook-service -n webhook-system
-
-# Verify the service is gone
-kubectl get svc -n webhook-system
+# This simulates the realistic scenario where a CRD evolves to add conversion webhooks
+./scripts/break.sh
 ```
 
-### Step 12: Force Argo CD Cache Refresh
+**What the break script does:**
 
-After breaking the webhook service, we need to evict Argo CD's cache to see the full impact:
+1. **Verifies current state** - Shows that resources are accessible in both API versions
+2. **Removes webhook service** (if exists) - Simulates service unavailability with proper finalizer handling
+3. **Applies evolved CRD** - Updates the CRD to add conversion webhook pointing to non-existent service
+4. **Tests direct failures** - Confirms API access fails on target cluster due to broken webhook
+5. **Forces Argo CD cache refresh** - Uses API authentication to invalidate cluster cache (if port-forward is running)
+6. **Parses cluster response** - Intelligently detects and confirms the webhook failure
+7. **Shows application impact** - Displays how all target cluster applications are affected
 
-```bash
-# Restart Argo CD components to force cache refresh
-kubectl rollout restart deployment/argocd-server deployment/argocd-repo-server statefulset/argocd-application-controller -n argocd
+**🧠 Key Mechanism**: With v1 as storage and v2 as served, **every CRD operation requires conversion**, so the broken
+webhook affects **all cluster operations**.
 
-# Wait for restarts to complete
-kubectl rollout status deployment/argocd-server -n argocd
-kubectl rollout status deployment/argocd-repo-server -n argocd
+**Script Features:**
+- **Secure**: No credential leaks - passwords and tokens are never displayed
+- **Smart**: Only waits for application deletion if it exists, respects finalizers
+- **Intelligent**: Parses API responses to confirm webhook failure detection
+- **Graceful**: Provides helpful guidance when port-forward isn't running
+
+### Step 4: Observe the Cluster-Wide Failure
+
+After running the break script, you should observe:
+
+**Expected break script output:**
+```
+🔥 Simulating CRD Evolution with Broken Conversion Webhook
+🎯 Confirmed: Argo CD detected the broken conversion webhook
+   Error: conversion webhook service not found
 ```
 
-Reconnect to port forwarding:
-```bash
-kubectl port-forward svc/argocd-server -n argocd 8080:443 &
-```
+**In the Argo CD Dashboard:**
 
-Now you can observe how Argo CD reacts to the webhook failure:
-
-**In the Argo CD Dashboard (http://localhost:8080):**
-1. Navigate to the Applications view
-2. Look for sync errors or health issues with applications
-3. Check the application details for webhook-related errors
+- All applications targeting the cluster show "Unknown" health status
+- Applications cannot sync or refresh
+- Resource details show conversion webhook errors
 
 **Via CLI:**
+
 ```bash
-# Check Argo CD application status
+# Check application status - all should show issues
 kubectl get applications -n argocd
 
-# Get detailed status of our test application
-kubectl describe application example-crd-app -n argocd
+# Check application controller logs for the target error
+kubectl logs -l app.kubernetes.io/name=argocd-application-controller -n argocd --tail=50
 
-# Check Argo CD server logs for webhook errors
-kubectl logs -l app.kubernetes.io/name=argocd-server -n argocd --tail=50
-
-# Check repo server logs for webhook errors
-kubectl logs -l app.kubernetes.io/name=argocd-repo-server -n argocd --tail=50
-```
-
-You should see Argo CD struggling with resource discovery or synchronization due to the webhook failures.
-
-### Step 13: Reproduce the Direct Failures
-
-Now trigger operations that invoke the conversion webhook. These will fail with the service deleted:
-
-#### Failure Case 1: Create Time (Resource Creation)
-```bash
-# Try to apply the test resources - this will fail on the v1 resource
-kubectl apply -f manifests/test-resources.yaml
-```
-
-This should produce an error like:
-```
-Error from server: error when retrieving current configuration of:
-Resource: "conversion.example.com/v1, Resource=examples", GroupVersionKind: "conversion.example.com/v1, Kind=Example"
-Name: "test-example-v1", Namespace: "default"
-from server for: "manifests/test-resources.yaml": conversion webhook for conversion.example.com/v2, Kind=Example failed: Post "https://conversion-webhook-service.webhook-system.svc:443/convert?timeout=30s": service "conversion-webhook-service" not found
-```
-
-#### Failure Case 2: Read Time (Resource Access) - Replicates Argo CD Issue
-```bash
-# Clear kubectl cache and force API discovery
-kubectl api-resources --api-group=conversion.example.com
-
-# Try to access the v1 API version - this reliably triggers webhook calls
-kubectl get examples.v1.conversion.example.com
-```
-
-This should produce an error like:
-```
-Error from server: conversion webhook for conversion.example.com/v2, Kind=Example failed: Post "https://conversion-webhook-service.webhook-system.svc:443/convert?timeout=30s": service "conversion-webhook-service" not found
-```
-
-#### Observe Argo CD Impact
-After triggering these failures and restarting Argo CD components, check Argo CD again:
-```bash
-# Force Argo CD to refresh and see the impact
-kubectl patch application example-crd-app -n argocd --type='merge' -p='{"operation":{"initiatedBy":{"username":"admin"},"sync":{"revision":"HEAD"}}}'
-
-# Check for errors in Argo CD logs related to resource discovery
-kubectl logs -l app.kubernetes.io/name=argocd-application-controller -n argocd --tail=20 | grep -i "conversion\|webhook\|error"
+# Test direct access in target cluster (should fail)
+kubectl config use-context kind-target-cluster
+kubectl get examples  # This should fail
 ```
 
 ### Expected Error Output
 
-You should see errors similar to:
+You should see the **cluster-wide failure pattern**:
 
-**For API version access:**
-```
-Error from server: conversion webhook for conversion.example.com/v2, Kind=Example failed: Post "https://conversion-webhook-service.webhook-system.svc:443/convert?timeout=30s": service "conversion-webhook-service" not found
-```
+**Target Error Pattern (the one we want to reproduce):**
 
-**For resource creation/updates:**
 ```
-Error from server: error when retrieving current configuration of:
-Resource: "conversion.example.com/v1, Resource=examples", GroupVersionKind: "conversion.example.com/v1, Kind=Example"
-Name: "test-example-v1", Namespace: "default"
-from server for: "manifests/test-resources.yaml": conversion webhook for conversion.example.com/v2, Kind=Example failed: Post "https://conversion-webhook-service.webhook-system.svc:443/convert?timeout=30s": service "conversion-webhook-service" not found
+Failed to load target state: failed to get cluster version for cluster "https://172.18.0.3:6443": 
+failed to get cluster info for "https://172.18.0.3:6443": error synchronizing cache state : 
+failed to sync cluster https://172.18.0.3:6443: failed to load initial state of resource 
+Example.conversion.example.com: conversion webhook for conversion.example.com/v1, Kind=Example failed: 
+Post "https://conversion-webhook-service.webhook-system.svc:443/convert?timeout=30s": 
+service "conversion-webhook-service" not found
 ```
 
-**Key Points:**
-- The webhook failure occurs when the API server tries to convert between v1 and v2 versions
-- Operations involving v1 resources fail because v2 is the storage version, requiring conversion
-- The error specifically mentions the missing service, demonstrating the exact failure mode
-- This reproduces the same type of failure that affects Argo CD when conversion webhook services are unavailable
-- **Argo CD Impact**: Resource discovery, synchronization, and health checks all fail when conversion webhooks are unavailable
+**Argo CD Application Impact:**
 
-### Step 14: Restore Service and Observe Recovery
+- All applications targeting the cluster show "Unknown" health status
+- Sync operations fail with cache synchronization errors
+- Resource discovery fails cluster-wide
 
-To restore functionality and see Argo CD recover:
+**Direct API Access (in target cluster):**
 
 ```bash
-# Recreate the webhook service
-kubectl apply -f manifests/webhook-deployment.yaml
+kubectl get examples
+# Error: conversion webhook for conversion.example.com/v1, Kind=Example failed: 
+# Post "https://conversion-webhook-service.webhook-system.svc:443/convert?timeout=30s": 
+# service "conversion-webhook-service" not found
+```
 
-# Wait for the pod to be ready (if deployment still exists)
-kubectl wait --for=condition=ready pod -l app=conversion-webhook -n webhook-system --timeout=60s
+### Step 5: Restore Functionality
 
-# Verify operations work again
-kubectl get examples.v1.conversion.example.com
+```bash
+# Run the fix script to restore functionality
+./scripts/fix.sh
+```
+
+**What the fix script does:**
+
+The fix script offers **three restoration options**:
+
+1. **Deploy working webhook service via Argo CD (GitOps approach)**:
+   - Builds and loads webhook server Docker image
+   - Generates proper TLS certificates with correct SAN names
+   - Deploys webhook service directly to break the deadlock
+   - Creates Argo CD application for ongoing GitOps management
+   - Intelligently parses cache response to confirm restoration
+
+2. **Remove conversion webhook (revert to no-conversion state)**:
+   - Applies the original CRD manifest without conversion webhook
+   - Simplest approach but loses conversion capability
+
+3. **Deploy webhook service directly in target cluster (non-GitOps)**:
+   - Generates certificates and deploys webhook using existing manifests
+   - Direct kubectl approach without Argo CD application
+
+**Script Features:**
+- **Interactive**: Prompts user to choose restoration method
+- **Secure**: No credential leaks during authentication
+- **Intelligent**: Parses cluster response to confirm fix success
+- **Comprehensive**: Verifies CRD functionality and application recovery
+
+**Expected fix script output:**
+```
+🎯 Confirmed: Cluster connection restored - webhook is working
+✅ Applications should return to Synced/Healthy status
+```
+
+**🔄 Repeatable Testing**: You can now run `./scripts/break.sh` and `./scripts/fix.sh` repeatedly to test the
+failure/recovery cycle without full environment reset.
+
+### Step 6: Verify Recovery
+
+After running the fix script:
+
+```bash
+# Check that applications return to healthy status
+kubectl get applications -n argocd
+
+# Verify target cluster resource access works
+kubectl config use-context kind-target-cluster
 kubectl get examples
 
-# Restart Argo CD components again to clear error states
-kubectl rollout restart deployment/argocd-server -n argocd
-kubectl rollout restart deployment/argocd-repo-server -n argocd
-
-# Wait for restarts to complete
-kubectl rollout status deployment/argocd-server -n argocd
-kubectl rollout status deployment/argocd-repo-server -n argocd
-
-# Trigger Argo CD to resync and observe recovery
-kubectl patch application example-crd-app -n argocd --type='merge' -p='{"operation":{"initiatedBy":{"username":"admin"},"sync":{"revision":"HEAD"}}}'
-
-# Check Argo CD application status recovery
-kubectl get applications -n argocd
+# Check Argo CD dashboard - applications should be Synced/Healthy
 ```
 
-You should see Argo CD applications return to healthy status once the webhook service is restored and caches are cleared.
-
-### Step 15: Cleanup
+### Step 7: Cleanup
 
 ```bash
-# Stop the port-forward (if running in background, find the PID and kill it)
-pkill -f "kubectl port-forward.*argocd-server" || echo "Port-forward already stopped"
-
-# Delete test resources and applications
-kubectl delete examples --all
-kubectl delete applications --all -n argocd
-kubectl delete -f manifests/
-
-# Uninstall Argo CD
-helm uninstall argocd -n argocd
-kubectl delete namespace argocd
-kubectl delete namespace webhook-system
-
-# Delete the kind cluster
-kind delete cluster --name webhook-test
-
-# Clean up temporary certificate files
-rm -rf /tmp/webhook-certs
+# Run the cleanup script to remove all resources
+./scripts/cleanup.sh
 ```
+
+This will:
+
+- Delete both Kind clusters (and all resources automatically)
+- Clean up temporary certificate files
+- Reset the environment for fresh testing
+
+## Script Details
+
+### setup.sh
+- **Purpose**: Creates complete test environment with two clusters and Argo CD
+- **Runtime**: ~5-8 minutes for initial setup
+- **Idempotent**: Can be run multiple times safely
+- **Prerequisites**: Kind, kubectl, helm, Docker
+
+### break.sh
+- **Purpose**: Simulates CRD evolution with broken conversion webhook
+- **Runtime**: ~30-60 seconds
+- **Key Feature**: Intelligent API response parsing to confirm webhook failure
+- **Security**: No credential leaks in output
+- **Requirements**: Port-forward to Argo CD for optimal experience (optional)
+
+### fix.sh
+- **Purpose**: Restores functionality via multiple approaches
+- **Runtime**: ~2-5 minutes depending on chosen option
+- **Interactive**: Prompts for restoration method selection
+- **Key Feature**: Intelligent cluster state detection to confirm recovery
+- **Options**: GitOps deployment, webhook removal, or direct deployment
+
+### cleanup.sh
+- **Purpose**: Complete environment teardown
+- **Runtime**: ~30 seconds
+- **Effect**: Removes all Kind clusters and temporary files
 
 ## Key Points Demonstrated
 
-1. **CRD Retrieval Failure**: When the conversion webhook service is unavailable, `kubectl get crd` operations fail
-2. **Resource Operations Blocked**: All operations involving the CRD (create, read, update, delete) are blocked
-3. **Kubernetes API Dependency**: The Kubernetes API server cannot process requests for the CRD without a working conversion webhook
-4. **Service Discovery**: The error shows that Kubernetes tries to reach the webhook service but cannot establish a connection
-5. **Argo CD Integration**: Demonstrates how these webhook failures directly impact Argo CD's ability to:
-    - Discover and manage custom resources
-    - Perform application synchronization
-    - Maintain resource health monitoring
-    - Execute automated sync policies
-6. **Cache Management**: Shows the importance of restarting Argo CD components to properly observe webhook failures and recoveries
+This reproduction demonstrates the **exact cluster-wide failure scenario** from Argo CD issue #20828:
 
-This reproduction case demonstrates the exact scenario described in the Argo CD issue where CRD operations fail when conversion webhook services are unavailable.
+1. **🎯 Realistic CRD Evolution**: Simulates how CRDs evolve from simple multi-version to requiring conversion webhooks
+2. **🌊 Cluster-Wide Impact**: Unlike resource-specific failures, this affects **ALL applications** in the target cluster
+3. **⚡ Cache Synchronization Failure**: The error occurs during Argo CD's cluster cache building process, not individual
+   resource operations
+4. **🎮 Application Controller Impact**: The failure originates from the gitops-engine in the application controller,
+   causing the "Unknown" status
+5. **🔄 GitOps Integration**: Shows both failure and recovery through Argo CD application management
+6. **🧠 Storage/Served Version Mechanics**: Demonstrates why v1 storage + v2 served + broken webhook = mandatory
+   conversion failure
+
+### Critical Insight: Storage vs Served Versions
+
+**Why v1 storage + v2 served triggers cluster-wide failure:**
+
+- All resources stored as v1 in etcd
+- API server serves both v1 and v2
+- **Any operation** may require conversion between versions
+- Argo CD's cluster discovery triggers conversions during cache building
+- Broken webhook = **every conversion fails** = **entire cluster cache fails**
+
+This is different from v2 storage + v1 served, where v1 operations work without conversion.
+
+### Difference from Other Webhook Failures
+
+**Resource-Specific Failure** (what most reproductions show):
+
+```
+Failed to load live state: conversion webhook failed...
+```
+
+- Only affects apps using the specific CRD
+- Occurs during resource comparison
+- Apps show sync errors but remain "Healthy"
+
+**Cluster-Wide Cache Failure** (this reproduction):
+
+```
+Failed to load target state: failed to get cluster version... error synchronizing cache state
+```
+
+- Affects **ALL** applications in the target cluster
+- Occurs during cluster discovery/cache building
+- Apps show "Unknown" health status
+- Originates from application controller, not server/repo-server
+
+This reproduction successfully demonstrates the second, more severe failure mode that was reported in the GitHub issue.
 
 ## Project Structure
 
@@ -354,21 +329,46 @@ This reproduction case demonstrates the exact scenario described in the Argo CD 
 webhook-conversion/
 ├── cmd/
 │   └── webhook/
-│       └── main.go
+│       └── main.go                        # Webhook server main entry point
 ├── pkg/
 │   └── webhook/
-│       ├── conversion.go
-│       ├── handler.go
-│       └── types.go
+│       ├── conversion.go                  # Conversion logic between v1/v2
+│       ├── handler.go                     # HTTP request handlers
+│       └── types.go                       # Go type definitions for CRD
 ├── manifests/
-│   ├── crd-with-webhook.yaml
-│   ├── webhook-deployment.yaml
-│   ├── test-resources.yaml
-│   └── argocd-applications.yaml
+│   ├── crd-no-conversion.yaml            # Initial CRD without webhook
+│   ├── crd-with-broken-webhook.yaml      # Evolved CRD with broken webhook
+│   ├── webhook-deployment.yaml           # Webhook service deployment
+│   ├── test-resources.yaml               # Sample resources in both versions
+│   ├── argocd-applications.yaml          # Cross-cluster applications
+│   ├── external-cluster-applications.yaml # External cluster app templates
+│   ├── argocd.yaml                       # Argo CD self-management
+│   ├── argocd-manager-token.yaml         # Service account token template
+│   └── target-cluster-secret.yaml        # Cluster registration template
+├── webhook-service-managed/
+│   └── resources.yaml                    # GitOps-managed webhook service
 ├── argocd-managed/
-│   └── resources.yaml
-├── go.mod
-├── go.sum
-├── Dockerfile
-└── README.md
+│   └── resources.yaml                    # Resources managed by Argo CD
+├── scripts/
+│   ├── setup.sh                          # Complete environment setup
+│   ├── break.sh                          # CRD evolution failure simulation
+│   ├── fix.sh                            # Multiple restoration approaches  
+│   └── cleanup.sh                        # Environment teardown
+├── go.mod                                # Go module definition
+├── go.sum                                # Go module checksums
+├── Dockerfile                            # Webhook server container image
+├── .gitignore                            # Git ignore patterns
+├── LICENSE                               # Apache 2.0 license
+└── README.md                             # This file
 ```
+
+## Key Features
+
+- **GitOps-Native**: Uses Argo CD applications to manage webhook services
+- **Repeatable**: Break/fix cycle without environment reset
+- **Realistic**: Simulates actual CRD evolution scenarios
+- **Educational**: Clear explanation of storage vs served version mechanics
+- **Secure**: No credential leaks in script output
+- **Intelligent**: API response parsing for confirmation of states
+- **Complete**: Includes all necessary components for reproduction
+- **Robust**: Proper finalizer handling and certificate management
