@@ -52,11 +52,11 @@ case $choice in
           --key=tls.key \
           -n webhook-system --dry-run=client -o yaml | kubectl apply -f -
 
-        CA_BUNDLE=$(cat ca.crt | base64 | tr -d '\n')
+        CA_BUNDLE=$(base64 -w 0 < ca.crt)
 
         # Update CRD with correct CA bundle FIRST
         echo "🔧 Patching CRD with CA bundle..."
-        kubectl patch crd examples.conversion.example.com --type='merge' -p='{"spec":{"conversion":{"webhook":{"clientConfig":{"caBundle":"'$CA_BUNDLE'"}}}}}'
+        kubectl patch crd examples.conversion.example.com --type='merge' -p "{\"spec\":{\"conversion\":{\"webhook\":{\"clientConfig\":{\"caBundle\":\"$CA_BUNDLE\"}}}}}"
 
         cd -
 
@@ -75,14 +75,48 @@ case $choice in
         # Invalidate cluster cache to speed up recovery
         echo "🔄 Invalidating cluster cache to accelerate recovery..."
         DOUBLE_ENCODED_SERVER=$(echo "$TARGET_SERVER" | sed 's/:/%253A/g' | sed 's/\//%252F/g')
-        curl -k -X POST \
-          "http://localhost:8080/api/v1/clusters/$DOUBLE_ENCODED_SERVER/invalidate-cache" \
-          -H "Content-Type: application/json" \
-          -d '{}' \
-          --fail-with-body || echo "⚠️ Cache invalidation may have failed - cache will refresh automatically"
+
+        # Check if port-forward is running by testing connectivity
+        if curl -k -s --connect-timeout 3 "https://localhost:8080/api/version" > /dev/null 2>&1; then
+          echo "✅ Argo CD API is accessible at localhost:8080"
+
+          # Get the admin password and authenticate
+          ADMIN_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+
+          LOGIN_RESPONSE=$(curl -k -s -X POST \
+            "https://localhost:8080/api/v1/session" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"admin\",\"password\":\"$ADMIN_PASSWORD\"}" \
+            2>/dev/null || echo '{"error":"LOGIN_FAILED"}')
+
+          if echo "$LOGIN_RESPONSE" | grep -q '"token"'; then
+            TOKEN=$(echo "$LOGIN_RESPONSE" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+
+            if [[ -n "$TOKEN" && "$TOKEN" != "null" ]]; then
+              echo "✅ Authentication successful, invalidating cache..."
+
+              curl -k -s -L -X POST \
+                "https://localhost:8080/api/v1/clusters/$DOUBLE_ENCODED_SERVER/invalidate-cache" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $TOKEN" \
+                -d '{}' > /dev/null && echo "✅ Cache invalidated successfully" || echo "⚠️ Cache invalidation may have failed - cache will refresh automatically"
+            else
+              echo "⚠️ Could not extract token - cache will refresh automatically"
+            fi
+          else
+            echo "⚠️ Authentication failed - cache will refresh automatically"
+          fi
+        else
+          echo "⚠️ Argo CD API not accessible at localhost:8080"
+          echo "💡 To enable API access, run in another terminal:"
+          echo "   kubectl port-forward svc/argocd-server -n argocd 8080:443 &"
+          echo "📋 Cache will refresh automatically when applications sync"
+        fi
 
         # NOW create the Argo CD application for ongoing GitOps management
         echo "📱 Creating Argo CD application for ongoing webhook service management..."
+
+        # Apply the application manifest with substitution
         sed "s|TARGET_SERVER_PLACEHOLDER|$TARGET_SERVER|g" manifests/webhook-service-app.yaml | kubectl apply -f -
 
         # Provide URL for manual cache invalidation if needed
@@ -119,16 +153,18 @@ case $choice in
         openssl genrsa -out ca.key 2048
         openssl req -new -x509 -days 365 -key ca.key -out ca.crt -subj "/C=CA/ST=Province/O=Example"
         openssl genrsa -out tls.key 2048
-        openssl req -new -key tls.key -out server.csr -subj "/C=CA/ST=Province/O=Example" -addext "subjectAltName=DNS:nonexistent-webhook-service.webhook-system.svc,DNS:nonexistent-webhook-service.webhook-system.svc.cluster.local"
-        openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out tls.crt -days 365 -extensions v3_req -extfile <(echo -e "[ v3_req ]\nsubjectAltName=DNS:nonexistent-webhook-service.webhook-system.svc,DNS:nonexistent-webhook-service.webhook-system.svc.cluster.local")
+        openssl req -new -key tls.key -out server.csr -subj "/C=CA/ST=Province/O=Example" -addext "subjectAltName=DNS:conversion-webhook-service.webhook-system.svc,DNS:conversion-webhook-service.webhook-system.svc.cluster.local"
+        openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out tls.crt -days 365 -extensions v3_req -extfile <(echo -e "[ v3_req ]\nsubjectAltName=DNS:conversion-webhook-service.webhook-system.svc,DNS:conversion-webhook-service.webhook-system.svc.cluster.local")
 
         kubectl create secret tls webhook-certs \
           --cert=tls.crt \
           --key=tls.key \
           -n webhook-system --dry-run=client -o yaml | kubectl apply -f -
 
-        CA_BUNDLE=$(cat ca.crt | base64 | tr -d '\n')
-        kubectl patch crd examples.conversion.example.com --type='merge' -p='{"spec":{"conversion":{"webhook":{"clientConfig":{"caBundle":"'$CA_BUNDLE'"}}}}}'
+        CA_BUNDLE=$(base64 -w 0 < ca.crt)
+
+        # Update CRD with correct CA bundle
+        kubectl patch crd examples.conversion.example.com --type='merge' -p "{\"spec\":{\"conversion\":{\"webhook\":{\"clientConfig\":{\"caBundle\":\"$CA_BUNDLE\"}}}}}"
 
         # Deploy webhook using the existing GitOps manifest directly
         kubectl apply -f webhook-service-managed/resources.yaml
@@ -173,31 +209,62 @@ DOUBLE_ENCODED_SERVER=$(echo "$TARGET_SERVER" | sed 's/:/%253A/g' | sed 's/\//%2
 # Invalidate cluster cache to ensure Argo CD sees the recovery
 echo "🔄 Invalidating cluster cache to ensure Argo CD sees the recovery..."
 
-# Get the admin password and authenticate
-ADMIN_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
-LOGIN_RESPONSE=$(curl -k -X POST \
-  "http://localhost:8080/api/v1/session" \
-  -H "Content-Type: application/json" \
-  -d "{\"username\":\"admin\",\"password\":\"$ADMIN_PASSWORD\"}" \
-  --fail-with-body 2>/dev/null || echo "LOGIN_FAILED")
+# Check if port-forward is running by testing connectivity
+if curl -k -s --connect-timeout 3 "http://localhost:8080/api/version" > /dev/null 2>&1; then
+  echo "✅ Argo CD API is accessible at localhost:8080"
 
-if [[ "$LOGIN_RESPONSE" != *"LOGIN_FAILED"* ]]; then
-  TOKEN=$(echo "$LOGIN_RESPONSE" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
-  if [[ -n "$TOKEN" ]]; then
-    curl -k -L -X POST \
-      "http://localhost:8080/api/v1/clusters/$DOUBLE_ENCODED_SERVER/invalidate-cache" \
-      -H "Content-Type: application/json" \
-      -H "Authorization: Bearer $TOKEN" \
-      -d '{}' \
-      --fail-with-body || echo "⚠️ Cache invalidation may have failed - applications will recover automatically"
+  # Get the admin password and authenticate
+  ADMIN_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+
+  # Create temporary file for login request
+  cat > /tmp/argocd-login.json << EOF
+{
+  "username": "admin",
+  "password": "$ADMIN_PASSWORD"
+}
+EOF
+
+  LOGIN_RESPONSE=$(curl -k -s -X POST \
+    "http://localhost:8080/api/v1/session" \
+    -H "Content-Type: application/json" \
+    -d @/tmp/argocd-login.json 2>/dev/null || echo '{"error":"LOGIN_FAILED"}')
+
+  # Clean up login file
+  rm -f /tmp/argocd-login.json
+
+  if echo "$LOGIN_RESPONSE" | grep -q '"token"'; then
+    TOKEN=$(echo "$LOGIN_RESPONSE" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+
+    if [[ -n "$TOKEN" && "$TOKEN" != "null" ]]; then
+      echo "✅ Authentication successful, invalidating cache..."
+
+      # Create cache invalidation request file
+      echo '{}' > /tmp/cache-invalidate.json
+
+      curl -k -s -L -X POST \
+        "http://localhost:8080/api/v1/clusters/$DOUBLE_ENCODED_SERVER/invalidate-cache" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $TOKEN" \
+        -d @/tmp/cache-invalidate.json > /dev/null || echo "⚠️ Cache invalidation may have failed - applications will recover automatically"
+
+      # Clean up cache file
+      rm -f /tmp/cache-invalidate.json
+    else
+      echo "⚠️ Could not extract token - applications will recover automatically"
+    fi
+  else
+    echo "⚠️ Authentication failed - applications will recover automatically"
   fi
 else
-  echo "⚠️ Authentication failed - applications will recover automatically"
+  echo "⚠️ Argo CD API not accessible at localhost:8080"
+  echo "💡 To enable API access, run in another terminal:"
+  echo "   kubectl port-forward svc/argocd-server -n argocd 8080:443 &"
+  echo "📋 Applications will recover automatically when they sync"
 fi
 
 echo "🔄 Triggering application resync..."
-kubectl patch application external-cluster-app -n argocd --type='merge' -p='{"operation":{"initiatedBy":{"username":"admin"},"sync":{"revision":"HEAD"}}}' || true
-kubectl patch application webhook-test-external -n argocd --type='merge' -p='{"operation":{"initiatedBy":{"username":"admin"},"sync":{"revision":"HEAD"}}}' || true
+kubectl patch application external-cluster-app -n argocd --type='merge' -p '{"operation":{"initiatedBy":{"username":"admin"},"sync":{"revision":"HEAD"}}}' || true
+kubectl patch application webhook-test-external -n argocd --type='merge' -p '{"operation":{"initiatedBy":{"username":"admin"},"sync":{"revision":"HEAD"}}}' || true
 
 echo "⏳ Waiting for sync to complete..."
 sleep 15

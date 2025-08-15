@@ -88,48 +88,83 @@ DOUBLE_ENCODED_SERVER=$(echo "$TARGET_SERVER" | sed 's/:/%253A/g' | sed 's/\//%2
 echo "🔄 Method 1: Invalidate cluster cache via Argo CD API (with authentication)"
 echo "Using cluster: $TARGET_SERVER"
 
-# Get the admin password from the Kubernetes secret
-ADMIN_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+# Check if port-forward is running by testing connectivity
+echo "🔍 Checking Argo CD API connectivity..."
+if curl -k -s --connect-timeout 3 "https://localhost:8080/api/version" > /dev/null 2>&1; then
+  echo "✅ Argo CD API is accessible at localhost:8080"
 
-# First, login to get a session token
-echo "🔐 Authenticating with Argo CD..."
-LOGIN_RESPONSE=$(curl -k -X POST \
-  "http://localhost:8080/api/v1/session" \
-  -H "Content-Type: application/json" \
-  -d "{\"username\":\"admin\",\"password\":\"$ADMIN_PASSWORD\"}" \
-  --fail-with-body 2>/dev/null || echo "LOGIN_FAILED")
+  # Get the admin password from the Kubernetes secret
+  ADMIN_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
 
-if [[ "$LOGIN_RESPONSE" == *"LOGIN_FAILED"* ]]; then
-  echo "⚠️ Login failed - falling back to manual UI method"
-  ENCODED_TARGET_SERVER=$(echo "$TARGET_SERVER" | sed 's/:/%3A/g' | sed 's/\//%2F/g')
-  echo "   Argo CD Cluster Page: http://localhost:8080/settings/clusters/$ENCODED_TARGET_SERVER"
-  echo "   Click 'Invalidate Cache' button on the cluster page"
-else
-  # Extract the token from the login response
-  TOKEN=$(echo "$LOGIN_RESPONSE" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+  # First, login to get a session token
+  echo "🔐 Authenticating with Argo CD..."
+  echo "🔍 Admin password length: ${#ADMIN_PASSWORD}"
 
-  if [[ -n "$TOKEN" ]]; then
-    echo "✅ Authentication successful"
+  # Create JSON payload properly
+  JSON_PAYLOAD=$(printf '{"username":"admin","password":"%s"}' "$ADMIN_PASSWORD")
+  echo "🔍 JSON payload prepared (length: ${#JSON_PAYLOAD})"
 
-    # Now call the cache invalidation API with the token
-    echo "🔄 Calling cache invalidation API..."
-    RESPONSE=$(curl -k -L -X POST \
-      "http://localhost:8080/api/v1/clusters/$DOUBLE_ENCODED_SERVER/invalidate-cache" \
-      -H "Content-Type: application/json" \
-      -H "Authorization: Bearer $TOKEN" \
-      -d '{}' \
-      -w "\nHTTP_STATUS:%{http_code}" \
-      --fail-with-body 2>/dev/null || echo "CACHE_INVALIDATION_FAILED")
+  # Try authentication using HTTPS
+  echo "🔄 Attempting login via HTTPS..."
+  LOGIN_RESPONSE=$(curl -k -s -X POST \
+    "https://localhost:8080/api/v1/session" \
+    -H "Content-Type: application/json" \
+    -d "$JSON_PAYLOAD" \
+    -w "\nHTTP_STATUS:%{http_code}" \
+    2>/dev/null || echo 'CURL_FAILED')
 
-    if [[ "$RESPONSE" == *"CACHE_INVALIDATION_FAILED"* ]]; then
-      echo "⚠️ Cache invalidation API call failed"
+  echo "🔍 Login response: $LOGIN_RESPONSE"
+
+  # Check if login was successful and extract token
+  if echo "$LOGIN_RESPONSE" | grep -q '"token"'; then
+    TOKEN=$(echo "$LOGIN_RESPONSE" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+
+    if [[ -n "$TOKEN" && "$TOKEN" != "null" ]]; then
+      echo "✅ Authentication successful"
+      echo "🔑 Token extracted (length: ${#TOKEN})"
+
+      # Now call the cache invalidation API with the token
+      echo "🔄 Calling cache invalidation API..."
+      RESPONSE=$(curl -k -s -L -X POST \
+        "https://localhost:8080/api/v1/clusters/$DOUBLE_ENCODED_SERVER/invalidate-cache" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $TOKEN" \
+        -d '{}' \
+        -w "\nHTTP_STATUS:%{http_code}" 2>/dev/null || echo "CACHE_INVALIDATION_FAILED")
+
+      if [[ "$RESPONSE" == *"CACHE_INVALIDATION_FAILED"* ]]; then
+        echo "⚠️ Cache invalidation API call failed"
+      else
+        echo "✅ Cache invalidation successful"
+        echo "$RESPONSE"
+      fi
     else
-      echo "✅ Cache invalidation API response:"
-      echo "$RESPONSE"
+      echo "⚠️ Could not extract token from login response"
+      echo "Response: $LOGIN_RESPONSE"
     fi
   else
-    echo "⚠️ Could not extract token from login response"
+    echo "⚠️ Login failed or invalid response"
+    echo "Full response: $LOGIN_RESPONSE"
+    echo ""
+    echo "🔍 Debugging steps:"
+    echo "1. Verify port-forward is working: curl -k https://localhost:8080/api/version"
+    echo "2. Check admin password: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
+    echo "3. Test manual login via UI: https://localhost:8080"
+    echo "4. Manual curl test: curl -k -X POST https://localhost:8080/api/v1/session -H 'Content-Type: application/json' -d '{\"username\":\"admin\",\"password\":\"YOURPASSWORD\"}'"
   fi
+else
+  echo "⚠️ Argo CD API not accessible at localhost:8080"
+  echo "💡 To enable API access, run in another terminal:"
+  echo "   kubectl port-forward svc/argocd-server -n argocd 8080:443 &"
+  echo ""
+  echo "🔄 Alternative: Manual cache invalidation via UI"
+  ENCODED_TARGET_SERVER=$(echo "$TARGET_SERVER" | sed 's/:/%3A/g' | sed 's/\//%2F/g')
+  echo "   1. Start port-forward: kubectl port-forward svc/argocd-server -n argocd 8080:443 &"
+  echo "   2. Access Argo CD: http://localhost:8080"
+  echo "   3. Navigate to cluster settings: http://localhost:8080/settings/clusters/$ENCODED_TARGET_SERVER"
+  echo "   4. Click 'Invalidate Cache' button"
+  echo ""
+  echo "📋 For now, continuing with application refresh method..."
 fi
 
 echo ""
