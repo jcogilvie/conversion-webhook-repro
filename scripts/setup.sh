@@ -22,7 +22,8 @@ helm install argocd argo/argo-cd \
   --namespace argocd \
   --set server.service.type=ClusterIP \
   --set configs.params."server.insecure"=true \
-  --version 7.6.10
+  --version 8.5.8
+#--version 7.6.10
 
 echo "⏳ Waiting for Argo CD server to be ready..."
 kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-server -n argocd --timeout=300s

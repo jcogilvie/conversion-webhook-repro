@@ -173,6 +173,62 @@ case $choice in
         kubectl config use-context kind-target-cluster
         kubectl apply -f manifests/crd-no-conversion.yaml
         echo "✅ CRD reverted to no-conversion state"
+        
+        echo "🔄 Switching back to Argo CD cluster..."
+        kubectl config use-context kind-argocd-cluster
+        
+        # Get target server details for cache invalidation
+        TARGET_SERVER_RAW=$(kubectl config view --context=kind-target-cluster -o jsonpath='{.clusters[?(@.name=="kind-target-cluster")].cluster.server}')
+        TARGET_CONTAINER_IP=$(docker inspect target-cluster-control-plane --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+        TARGET_SERVER="https://${TARGET_CONTAINER_IP}:6443"
+        
+        # Invalidate cluster cache to speed up recovery
+        echo "🔄 Invalidating cluster cache to accelerate recovery..."
+        DOUBLE_ENCODED_SERVER=$(echo "$TARGET_SERVER" | sed 's/:/%253A/g' | sed 's/\//%252F/g')
+
+        # Check if port-forward is running by testing connectivity
+        if curl -k -s --connect-timeout 3 "https://localhost:8080/api/version" > /dev/null 2>&1; then
+          echo "✅ Argo CD API is accessible at localhost:8080"
+
+          # Get the admin password and authenticate
+          ADMIN_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+
+          LOGIN_RESPONSE=$(curl -k -s -X POST \
+            "https://localhost:8080/api/v1/session" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"admin\",\"password\":\"$ADMIN_PASSWORD\"}" \
+            2>/dev/null || echo '{"error":"LOGIN_FAILED"}')
+
+          if echo "$LOGIN_RESPONSE" | grep -q '"token"'; then
+            TOKEN=$(echo "$LOGIN_RESPONSE" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+
+            if [[ -n "$TOKEN" && "$TOKEN" != "null" ]]; then
+              echo "✅ Authentication successful, invalidating cache..."
+
+              CACHE_RESPONSE=$(curl -k -s -L -X POST \
+                "https://localhost:8080/api/v1/clusters/$DOUBLE_ENCODED_SERVER/invalidate-cache" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $TOKEN" \
+                -d '{}' \
+                2>/dev/null || echo "CACHE_INVALIDATION_FAILED")
+
+              if [[ "$CACHE_RESPONSE" == *"CACHE_INVALIDATION_FAILED"* ]]; then
+                echo "⚠️ Cache invalidation may have failed - cache will refresh automatically"
+              else
+                echo "✅ Cache invalidated successfully"
+              fi
+            else
+              echo "⚠️ Could not extract token - cache will refresh automatically"
+            fi
+          else
+            echo "⚠️ Authentication failed - cache will refresh automatically"
+          fi
+        else
+          echo "⚠️ Argo CD API not accessible at localhost:8080"
+          echo "💡 To enable API access, run in another terminal:"
+          echo "   kubectl port-forward svc/argocd-server -n argocd 8080:443 &"
+          echo "📋 Cache will refresh automatically when applications sync"
+        fi
         ;;
 
     3)

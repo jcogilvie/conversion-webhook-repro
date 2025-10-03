@@ -25,11 +25,9 @@ spec:
     namespace: argocd
 
   syncPolicy:
-    # Don't autosync argo.  All it wants to do is add a label, but in so doing it kills port forwarding
-    # by restarting the app.  Not a killer, but annoying and avoidable.
-#    automated:
-#      prune: true
-#      selfHeal: true
+    automated:
+      prune: true
+      selfHeal: true
     
     # Sync options for proper management
     syncOptions:

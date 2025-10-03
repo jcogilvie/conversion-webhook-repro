@@ -190,9 +190,9 @@ else
   echo "📋 For now, continuing with application refresh method..."
 fi
 
-echo ""
-echo "🔄 Method 2: Force application refresh (triggers cache rebuild)"
-kubectl patch application external-cluster-app -n argocd --type='merge' -p='{"operation":{"initiatedBy":{"username":"admin"},"info":[{"name":"reason","value":"force-refresh-after-crd-evolution"}]}}' || echo "Patch failed - this is expected"
+# echo ""
+# echo "🔄 Method 2: Force application refresh (triggers cache rebuild)"
+# kubectl patch application external-cluster-app -n argocd --type='merge' -p='{"operation":{"initiatedBy":{"username":"admin"},"info":[{"name":"reason","value":"force-refresh-after-crd-evolution"}]}}' || echo "Patch failed - this is expected"
 
 echo ""
 echo "📊 Step 7: Check application status for cluster-wide failure"
